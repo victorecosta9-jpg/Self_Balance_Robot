@@ -67,3 +67,30 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# ESP-IDF Build Artifacts
+build/
+sdkconfig
+sdkconfig.old
+
+# Arduino IDE / ESP32 Build Files
+.build/
+*.hex
+*.elf
+*.bin
+
+# Toolchain and Local Configurations
+.esp_idf/
+managed_components/
+dependencies.lock
+
+# IDE Specific Files (VS Code / Eclipse)
+.vscode/
+.settings/
+.project
+.cproject
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
