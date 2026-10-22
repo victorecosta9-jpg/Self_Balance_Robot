@@ -24,7 +24,7 @@
 //   parada se o I2C ficar instavel.
 // - NAO reduza o ganho abaixo de ~0.8x: a margem inferior e 0.52x.
 // ============================================================
-#define AIR_TEST 1
+#define AIR_TEST 0
 
 // SEGURANCA (1 = motores ligados; use SOMENTE com robo suspenso)
 #define MOTORS_ENABLED 1
@@ -63,7 +63,7 @@ const float KV_USE = AIR_TEST ? 0.0f : K_V;
 
 const float U_LIMIT_V = 11.1f;
 const float RAMP_S = 0.03f;
-const float TRIM_DEG = 0.0f;  // V2: -1.5 era chute; medir o ponto de equilibrio real
+const float TRIM_DEG = 1.0f;  // V2: -1.5 era chute; medir o ponto de equilibrio real
 
 #define WIN_V 4
 
