@@ -1,5 +1,4 @@
-
-#include <Arduino.h>
+ #include <Arduino.h>
 #include <Wire.h>
 #include <math.h>
 #include <string.h>
@@ -10,7 +9,7 @@
 #include "driver/pcnt.h"
 
 // ============================================================
-// FW2 - CHAO COM PROTECOES (EXECUTE SOMENTE APOS FW1 APROVADO)
+// FW2 V4 - V3 + ciclo disparado pela interrupcao do DMP (com fallback por timer)
 // - Usar com cabo de seguranca (tether) e superficie de atrito.
 // - Ganhos completos K_X..K_W do LQR, sem escala 0.925 (u = esforco).
 // - Rampa 30 ms; zona morta suavizada (rampa 1.5 V) para manter o
@@ -28,9 +27,9 @@
 
 // SEGURANCA (1 = motores ligados; use SOMENTE com robo suspenso)
 #define MOTORS_ENABLED 1
-#define USE_MPU_INT 0
+#define USE_MPU_INT 1  // V4: precisa do pino INT do MPU6050 ligado ao GPIO4
 #define GYRO_FROM_DMP 1
-#define STREAM_SERIAL 0  // prints durante o controle estouram o ciclo (16 ms)
+#define STREAM_SERIAL 0  // V4.1: 0 para o diagnostico (prints no controle bloqueiam o laco)
 
 // PINOS
 #define PIN_I2C_SCL 22
@@ -63,7 +62,7 @@ const float KV_USE = AIR_TEST ? 0.0f : K_V;
 
 const float U_LIMIT_V = 11.1f;
 const float RAMP_S = 0.03f;
-const float TRIM_DEG = 1.0f;  // V2: -1.5 era chute; medir o ponto de equilibrio real
+const float TRIM_DEG = 0.0f;
 
 #define WIN_V 4
 
@@ -90,13 +89,18 @@ const float DEADBAND_RAMP_V = 1.5f;
 #define PWM_MAX ((1 << PWM_BITS) - 1)
 
 // IMU
-#define I2C_FREQ_HZ 100000
+#define I2C_FREQ_HZ 400000  // V3: maximo do MPU6050
 
 const float DMP_GYRO_LSB_PER_DPS = 16.4f;
-const uint32_t DMP_TIMEOUT_US = 50000;
-const float ANGLE_FALL_LIMIT_DEG = 25.0f;
+const uint32_t DMP_TIMEOUT_US = 30000;  // V2: era 50 ms
+const float ANGLE_FALL_LIMIT_DEG = 50.0f;
 
 // Protecoes (FW2)
+const uint32_t EXT_MAX_CICLOS = 2;       // V2: ciclos seguidos extrapolando antes de parar
+const uint8_t GLITCH_REJ_MAX = 2;        // V1: rejeicoes seguidas antes de aceitar o novo valor
+const float OMEGA_MAX_RADS = 10.0f;      // V1: |omega| acima disso e impossivel para este pendulo
+const float OMEGA_SALTO_RADS = 6.0f;     // V1: salto maximo de omega em 1 ciclo
+const uint8_t QUEDA_CICLOS = 3;          // V1: ciclos seguidos acima do limite para declarar queda
 const float GLITCH_THETA_DEG = 8.0f;     // salto maximo de theta em 1 ciclo
 const float VEL_MAX_MPS = 1.5f;          // fisico max ~1.77 m/s
 const float VEL_GLITCH_MPS = 0.6f;       // salto maximo de vel em 1 ciclo
@@ -206,9 +210,35 @@ volatile bool watchdog_ativo = false;
 volatile bool watchdog_disparou = false;
 const uint32_t WATCHDOG_US = 40000;
 
+// V4.1 DIAGNOSTICO: em qual operacao de I2C o laco estava quando travou.
+enum FaseI2C : uint8_t {
+  F_NENHUMA = 0, F_INT_STATUS, F_FIFO_COUNT, F_FIFO_LER, F_FIFO_RESET, F_GIRO
+};
+volatile uint8_t fase_i2c = F_NENHUMA;
+volatile uint8_t wd_fase = F_NENHUMA;
+
+static const char* nomeFase(uint8_t f) {
+  switch (f) {
+    case F_INT_STATUS: return "getIntStatus";
+    case F_FIFO_COUNT: return "getFIFOCount";
+    case F_FIFO_LER:   return "leitura_FIFO";
+    case F_FIFO_RESET: return "resetFIFO";
+    case F_GIRO:       return "giroscopio";
+    default:           return "fora_do_I2C";
+  }
+}
+
+// Orcamento de I2C por ciclo: depois de uma operacao que estourou, as
+// seguintes sao puladas (senao 5 operacoes x 8 ms de timeout = 40 ms).
+uint32_t t_ciclo_ini_us = 0;
+const uint32_t I2C_BUDGET_US = 6000;
+uint32_t i2c_orcamento_estourado = 0;
+uint32_t fifo_desalinhada = 0;
+
 static void watchdogCb(void*) {
   if (watchdog_ativo &&
       (uint32_t)(micros() - ultimo_ciclo_us) > WATCHDOG_US) {
+    wd_fase = fase_i2c;
     motorEsq.stop();
     motorDir.stop();
     watchdog_disparou = true;
@@ -293,13 +323,19 @@ Quaternion q;
 VectorFloat gravity;
 float ypr[3];
 
-#if USE_MPU_INT
+// V4: interrupcao do DMP. Sem #if: o codigo decide em tempo de execucao se
+// o pino INT esta realmente ligado (conta interrupcoes durante o settle).
 volatile bool mpuInterrupt = false;
+volatile uint32_t int_count = 0;
 
 void IRAM_ATTR dmpDataReady() {
   mpuInterrupt = true;
+  int_count = int_count + 1;
 }
-#endif
+
+bool usa_int = false;
+uint32_t ultimo_disparo_us = 0;
+const uint32_t DISPARO_FALLBACK_US = 14000;  // se a INT sumir, roda mesmo assim (extrapolando)
 
 float dmp_roll_deg = 0.0f;
 float dmp_gyro_dps = 0.0f;
@@ -308,6 +344,7 @@ float dmp_roll_ant = 0.0f;
 
 uint32_t dmp_ultimo_us = 0;
 uint32_t dmp_pacotes = 0;
+uint32_t fifo_invalidos = 0;  // V1: pacotes descartados por leitura incompleta / quaternion invalido
 uint32_t fifo_overflow = 0;
 uint32_t t_poll_us = 0;
 uint32_t t_deriv_us = 0;
@@ -318,31 +355,159 @@ static inline float wrap180(float a) {
   return a;
 }
 
+static bool orcamentoEstourado() {
+  if ((uint32_t)(micros() - t_ciclo_ini_us) > I2C_BUDGET_US) {
+    i2c_orcamento_estourado++;
+    return true;
+  }
+  return false;
+}
+
+static void resetaFifo() {
+  fase_i2c = F_FIFO_RESET;
+  mpu.resetFIFO();
+  fase_i2c = F_NENHUMA;
+}
+
+static uint16_t leFifoCount() {
+  fase_i2c = F_FIFO_COUNT;
+  const uint16_t n = mpu.getFIFOCount();
+  fase_i2c = F_NENHUMA;
+  return n;
+}
+
 // LEITURA FIFO DMP
-bool lerFIFO() {
+// com_orc = true so dentro do controle(); no setup nao ha orcamento.
+
+volatile uint32_t diag_pior_us = 0, diag_pior_tx_us = 0, diag_pior_rx_us = 0;
+volatile uint8_t diag_pior_errTx = 0, diag_pior_got = 0, diag_pior_sda = 1, diag_pior_scl = 1;
+// Leitura I2C com limite de tempo REAL. I2Cdev::readBytes usa um timeout
+// proprio (readTimeout, padrao 1000 ms) que ignora Wire.setTimeOut: foi o que
+// travou o ciclo por ~1,007 s. Aqui o pior caso e o timeout do Wire (8 ms).
+static int8_t lerBytesSeguro(uint8_t reg, uint8_t len, uint8_t* dst) {
+  const uint32_t t0 = micros();
+  Wire.beginTransmission(MPU6050_ADDRESS_AD0_LOW);
+  Wire.write(reg);
+  const uint8_t errTx = Wire.endTransmission(false);
+  const uint32_t t1 = micros();
+  uint8_t got = 0;
+  int8_t ret = -1;
+  if (errTx == 0) {
+    got = Wire.requestFrom((uint8_t)MPU6050_ADDRESS_AD0_LOW, len, (uint8_t)true);
+    if (got == len) {
+      ret = (int8_t)len;
+      for (uint8_t i = 0; i < len; i++) {
+        if (!Wire.available()) { ret = -1; break; }
+        dst[i] = Wire.read();
+      }
+    } else {
+      while (Wire.available()) Wire.read();
+    }
+  }
+  const uint32_t t2 = micros();
+  // guarda a PIOR chamada (so sobrescreve se for maior)
+  if (t2 - t0 > diag_pior_us) {
+    diag_pior_us = t2 - t0;
+    diag_pior_tx_us = t1 - t0;
+    diag_pior_rx_us = t2 - t1;
+    diag_pior_errTx = errTx;
+    diag_pior_got = got;
+    diag_pior_sda = digitalRead(PIN_I2C_SDA);
+    diag_pior_scl = digitalRead(PIN_I2C_SCL);
+  }
+  return ret;
+}
+
+bool lerFIFO(bool com_orc) {
   if (packetSize == 0) return false;
 
-  uint16_t n = mpu.getFIFOCount();
+  uint16_t n = leFifoCount();
+
+  if (com_orc && orcamentoEstourado()) return false;
 
   if (n >= 1024) {
-    mpu.resetFIFO();
+    resetaFifo();
     fifo_overflow++;
     return false;
   }
 
   if (n < packetSize) return false;
 
-  // Descarta pacotes antigos e preserva o mais recente.
-  while (n >= (uint16_t)(packetSize * 2)) {
-    mpu.getFIFOBytes(fifoBuffer, packetSize);
+  // V4.1: ALINHAMENTO. Com o disparo pela INT o DMP ja terminou de escrever
+  // o pacote, entao n deve ser multiplo exato de packetSize. Se nao for,
+  // confirma com uma segunda leitura (a contagem pode ter sido lida no meio
+  // da escrita) e so entao limpa a FIFO, sem tentar ler bytes desalinhados.
+  if (n % packetSize != 0) {
+    if (com_orc && orcamentoEstourado()) return false;
+
+    const uint16_t n2 = leFifoCount();
+
+    if (n2 < packetSize) return false;
+
+    if (n2 % packetSize != 0 || n2 >= 1024) {
+      resetaFifo();
+      fifo_desalinhada++;
+      fifo_overflow++;
+      return false;
+    }
+
+    n = n2;
+  }
+
+  // V3: FIFO muito atrasada (3+ pacotes) -> re-sincroniza em vez de gastar
+  // I2C lendo lixo velho (isso piorava um ciclo que ja estava lento).
+  if (n >= (uint16_t)(packetSize * 3)) {
+    resetaFifo();
+    fifo_overflow++;
+    return false;
+  }
+
+  // 2 pacotes: descarta so o mais antigo.
+  if (n >= (uint16_t)(packetSize * 2)) {
+    if (com_orc && orcamentoEstourado()) return false;
+
+    fase_i2c = F_FIFO_LER;
+    const int8_t desc = lerBytesSeguro(MPU6050_RA_FIFO_R_W, (uint8_t)packetSize, fifoBuffer);
+    fase_i2c = F_NENHUMA;
+    if (desc != (int8_t)packetSize) {
+      resetaFifo();
+      fifo_overflow++;
+      fifo_invalidos++;
+      return false;
+    }
     n -= packetSize;
   }
 
   if (n < packetSize) return false;
 
-  mpu.getFIFOBytes(fifoBuffer, packetSize);
+  // V1: leitura direta checando o retorno. Um timeout no meio do pacote
+  // desalinha a FIFO e todos os pacotes seguintes viram lixo; nesse caso
+  // descarta tudo e re-sincroniza.
+  if (com_orc && orcamentoEstourado()) return false;
+
+  fase_i2c = F_FIFO_LER;
+  const int8_t lidos = lerBytesSeguro(MPU6050_RA_FIFO_R_W, (uint8_t)packetSize, fifoBuffer);
+  fase_i2c = F_NENHUMA;
+
+  if (lidos != (int8_t)packetSize) {
+    resetaFifo();
+    fifo_overflow++;
+    fifo_invalidos++;
+    return false;
+  }
 
   mpu.dmpGetQuaternion(&q, fifoBuffer);
+
+  // quaternion unitario: se a norma estiver errada o pacote e lixo
+  const float nq = q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z;
+
+  if (nq < 0.95f || nq > 1.05f) {
+    resetaFifo();
+    fifo_overflow++;
+    fifo_invalidos++;
+    return false;
+  }
+
   mpu.dmpGetGravity(&gravity, &q);
   mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
 
@@ -375,31 +540,36 @@ bool lerFIFO() {
 }
 
 bool atualizaIMU(bool forcar) {
-#if USE_MPU_INT
-  if (mpuInterrupt) {
-    mpuInterrupt = false;
-    uint8_t st = mpu.getIntStatus();
+  if (usa_int) {
+    if (mpuInterrupt) {
+      mpuInterrupt = false;
 
-    if (st & 0x10) {
-      mpu.resetFIFO();
-      fifo_overflow++;
+      fase_i2c = F_INT_STATUS;
+      uint8_t st = mpu.getIntStatus();
+      fase_i2c = F_NENHUMA;
+
+      if (forcar && orcamentoEstourado()) return false;
+
+      if (st & 0x10) {
+        resetaFifo();
+        fifo_overflow++;
+        return false;
+      }
+    } else if (!forcar) {
       return false;
     }
-  } else if (!forcar) {
-    return false;
+  } else {
+    uint32_t agora = micros();
+
+    if (!forcar &&
+        (uint32_t)(agora - t_poll_us) < 1000) {
+      return false;
+    }
+
+    t_poll_us = agora;
   }
-#else
-  uint32_t agora = micros();
 
-  if (!forcar &&
-      (uint32_t)(agora - t_poll_us) < 1000) {
-    return false;
-  }
-
-  t_poll_us = agora;
-#endif
-
-  return lerFIFO();
+  return lerFIFO(forcar);
 }
 
 // RECUPERACAO DO BARRAMENTO I2C
@@ -494,6 +664,15 @@ int32_t pd_prev = 0;
 
 float pos = 0.0f;
 float vel = 0.0f;
+float theta_valido = 0.0f;       // V1: ultimo theta aceito
+bool theta_valido_ok = false;
+uint8_t rej_theta = 0;
+uint32_t glitches_theta = 0;
+uint32_t glitches_omega = 0;
+uint32_t pacote_usado = 0;       // V2: contador de pacotes ja consumidos
+uint32_t ciclos_ext = 0;
+uint32_t ext_total = 0;
+float omega_prev_ctrl = 0.0f;    // V2: omega do ciclo anterior (p/ extrapolar)
 uint32_t enc_glitches = 0;  // rajadas de encoder rejeitadas
 
 // Saude do I2C (V3.2). Normal: ~1.1 ms por ciclo (FIFO + giroscopio).
@@ -567,9 +746,10 @@ void relatorio() {
 
   Serial.printf("Amostras: %lu\n", (unsigned long)li);
 
-  Serial.printf("Pacotes DMP: %lu | overflow: %lu\n",
+  Serial.printf("Pacotes DMP: %lu | overflow/resync: %lu | invalidos: %lu\n",
                 (unsigned long)dmp_pacotes,
-                (unsigned long)fifo_overflow);
+                (unsigned long)fifo_overflow,
+                (unsigned long)fifo_invalidos);
 
   Serial.printf("TEMPO: dt_max=%.2f ms | ciclo_max=%lu us | ciclos>12ms: %lu\n",
                 dt_max * 1000.0f,
@@ -582,6 +762,26 @@ void relatorio() {
   Serial.printf("I2C: max=%lu us | ciclos>3ms=%lu\n",
                 (unsigned long)i2c_max_us,
                 (unsigned long)i2c_lentos);
+
+  Serial.printf("I2C orcamento estourado: %lu | FIFO desalinhada: %lu\n",
+                (unsigned long)i2c_orcamento_estourado,
+                (unsigned long)fifo_desalinhada);
+
+  Serial.printf("PIOR LEITURA FIFO: total=%lu us (tx=%lu rx=%lu) errTx=%u got=%u SDA=%u SCL=%u\n",
+                (unsigned long)diag_pior_us, (unsigned long)diag_pior_tx_us,
+                (unsigned long)diag_pior_rx_us, diag_pior_errTx, diag_pior_got,
+                diag_pior_sda, diag_pior_scl);
+
+  Serial.printf("GLITCH theta: %lu | GLITCH omega: %lu\n",
+                (unsigned long)glitches_theta,
+                (unsigned long)glitches_omega);
+
+  Serial.printf("EXTRAPOLACAO: %lu ciclos sem pacote novo\n",
+                (unsigned long)ext_total);
+
+  Serial.printf("DISPARO: %s | interrupcoes: %lu\n",
+                usa_int ? "INT do DMP" : "timer",
+                (unsigned long)int_count);
 
   Serial.printf("MODO: %s | K_X_uso=%.3f K_V_uso=%.3f | PPR=%.0f\n",
                 AIR_TEST ? "AR (X=V=0)" : "CHAO",
@@ -611,6 +811,7 @@ void relatorio() {
 
 // INICIO DO CONTROLE
 void iniciaControle() {
+  diag_pior_us = diag_pior_tx_us = diag_pior_rx_us = 0;
   Serial.println("[CONTROLE] Inicio da rotina a 100 Hz.");
 
   Serial.printf("[CONTROLE] Motores: %s\n",
@@ -627,9 +828,19 @@ void iniciaControle() {
   k = 0;
   li = 0;
   enc_glitches = 0;
+  glitches_theta = 0;
+  glitches_omega = 0;
+  theta_valido_ok = false;
+  rej_theta = 0;
+  ciclos_ext = 0;
+  ext_total = 0;
+  pacote_usado = dmp_pacotes;
+  omega_prev_ctrl = 0.0f;
   i2c_max_us = 0;
   i2c_lentos = 0;
   i2c_consec = 0;
+  i2c_orcamento_estourado = 0;
+  fifo_desalinhada = 0;
 
   dt_max = 0.0f;
   cyc_max = 0;
@@ -654,6 +865,7 @@ void iniciaControle() {
   prox_controle_us = t0_us + TS_US;
 
   ultimo_ciclo_us = micros();
+  ultimo_disparo_us = micros();
   watchdog_disparou = false;
   watchdog_ativo = true;
 
@@ -666,12 +878,15 @@ void controle() {
 
   const uint32_t idade_ciclo_us = t_entrada - ultimo_ciclo_us;
   ultimo_ciclo_us = t_entrada;
+  t_ciclo_ini_us = t_entrada;
 
   if (watchdog_disparou) {
     char bufw[48];
 
-    snprintf(bufw, sizeof(bufw), "watchdog (%lu us sem ciclo)",
-             (unsigned long)idade_ciclo_us);
+    // idade_ciclo_us = duracao TOTAL da parada; wd_fase = operacao I2C em
+    // andamento quando o watchdog disparou.
+    snprintf(bufw, sizeof(bufw), "wd %luus em %s",
+             (unsigned long)idade_ciclo_us, nomeFase(wd_fase));
 
     parar(bufw);
     return;
@@ -681,7 +896,15 @@ void controle() {
 
   // Giroscopio bruto, eixo X (+-2000 dps => 16.4 LSB/dps). Validado no
   // teste no ar: razao 1.015 com a derivada de theta, correlacao 0.99.
-  const int16_t gx_raw = mpu.getRotationX();
+  int16_t gx_raw = 0;
+  bool gyro_lido = false;
+
+  if (!orcamentoEstourado()) {
+    fase_i2c = F_GIRO;
+    gx_raw = mpu.getRotationX();
+    fase_i2c = F_NENHUMA;
+    gyro_lido = true;
+  }
 
   const uint32_t t_c = micros();
 
@@ -690,7 +913,7 @@ void controle() {
 
   if (t_i2c_us > i2c_max_us) i2c_max_us = t_i2c_us;
 
-  const bool i2c_suspeito = (t_i2c_us > I2C_SUSPEITO_US);
+  const bool i2c_suspeito = (t_i2c_us > I2C_SUSPEITO_US) || !gyro_lido;
 
   if (i2c_suspeito) {
     i2c_lentos++;
@@ -765,32 +988,62 @@ void controle() {
 
   // ANGULO RELATIVO: MESMA CONVENCAO DO PROFESSOR
   // theta = -(roll - referencia), em radianos.
-  const float angle_err_deg =
+  // V2: chegou pacote DMP novo desde o ultimo ciclo?
+  const bool pacote_novo = (dmp_pacotes != pacote_usado);
+  pacote_usado = dmp_pacotes;
+
+  float angle_err_deg =
       wrap180(angulo - (angle_ref + TRIM_DEG));
 
   float theta_novo = -(angle_err_deg * (PI / 180.0f));
 
-  // FILTRO DE GLITCH: rejeita salto impossivel de theta em 1 ciclo
-  static float theta_valido = 0.0f;
-  static bool theta_valido_ok = false;
-  static uint32_t glitches_theta = 0;
+  // Sem pacote novo (leitura falhou/rejeitada), dmp_roll_deg esta velho.
+  // Extrapola theta com o giroscopio por no maximo EXT_MAX_CICLOS ciclos.
+  if (!pacote_novo) {
+    ciclos_ext++;
+    ext_total++;
 
-  if (theta_valido_ok &&
+    if (ciclos_ext > EXT_MAX_CICLOS) {
+      parar("imu_sem_pacote");
+      return;
+    }
+
+    if (theta_valido_ok) {
+      theta_novo = theta_valido + omega_prev_ctrl * TS;
+    }
+  } else {
+    ciclos_ext = 0;
+  }
+
+  // FILTRO DE GLITCH: rejeita salto impossivel de theta em 1 ciclo, mas no
+  // maximo GLITCH_REJ_MAX ciclos seguidos. Sem esse limite o filtro travava
+  // num valor velho quando o angulo real passava de 8 graus do congelado.
+  if (pacote_novo && theta_valido_ok && rej_theta < GLITCH_REJ_MAX &&
       fabsf(theta_novo - theta_valido) >
           GLITCH_THETA_DEG * (PI / 180.0f)) {
     glitches_theta++;
-    theta_novo = theta_valido;
+    rej_theta++;
+    theta_novo = theta_valido + omega_prev_ctrl * TS;  // V2: extrapola em vez de congelar
+  } else if (pacote_novo) {
+    rej_theta = 0;
   }
 
+  angle_err_deg = -theta_novo * (180.0f / PI);  // V2: erro consistente com theta final
   theta = theta_novo;
   theta_valido = theta_novo;
   theta_valido_ok = true;
 
-  // PROTECAO CONTRA QUEDA
-  if (fabsf(angle_err_deg) > ANGLE_FALL_LIMIT_DEG) {
+  // PROTECAO CONTRA QUEDA: usa theta FILTRADO e exige persistencia, para
+  // um unico pacote ruim nao derrubar o robo.
+  static uint8_t cont_queda = 0;
+  const float theta_deg = fabsf(theta) * (180.0f / PI);
+
+  cont_queda = (theta_deg > ANGLE_FALL_LIMIT_DEG) ? cont_queda + 1 : 0;
+
+  if (cont_queda >= QUEDA_CICLOS) {
     char buf[40];
 
-    snprintf(buf, sizeof(buf), "queda (%.1f deg)", angle_err_deg);
+    snprintf(buf, sizeof(buf), "queda (%.1f deg)", theta_deg);
 
     parar(buf);
     return;
@@ -862,17 +1115,33 @@ void controle() {
   // OMEGA USADA NO CONTROLE: giroscopio bruto (sem o atraso de 1 amostra
   // da derivada). A derivada continua calculada so para o log.
   const float omega_deriv = omega;
-  omega = -GYRO_SIGN * (gx_raw / 16.4f) * (PI / 180.0f);
+  const float omega_nova = -GYRO_SIGN * (gx_raw / 16.4f) * (PI / 180.0f);
 
-  // Ciclo com I2C lento: a leitura do giroscopio nao e confiavel;
-  // mantem o ultimo valor bom.
+  // Validacao do giroscopio (V1): valor impossivel ou salto brusco indica
+  // leitura I2C corrompida. Rejeita, mas no maximo GLITCH_REJ_MAX ciclos
+  // seguidos (para nao travar num valor velho).
   static float omega_ok = 0.0f;
+  static uint8_t rej_omega = 0;
 
-  if (i2c_suspeito) {
+  const bool omega_suspeita =
+      (fabsf(omega_nova) > OMEGA_MAX_RADS ||
+       fabsf(omega_nova - omega_ok) > OMEGA_SALTO_RADS) &&
+      rej_omega < GLITCH_REJ_MAX;
+
+  if (i2c_suspeito || omega_suspeita) {
     omega = omega_ok;
+
+    if (omega_suspeita) {
+      rej_omega++;
+      glitches_omega++;
+    }
   } else {
+    omega = omega_nova;
     omega_ok = omega;
+    rej_omega = 0;
   }
+
+  omega_prev_ctrl = omega;
 
   // RAMPA INICIAL
   const float t_s =
@@ -1057,6 +1326,28 @@ bool inicializaRobo() {
     delay(1);
   }
 
+  {
+    // V3: taxa real de pacotes do DMP (a biblioteca costuma gerar ~100 Hz)
+    const uint32_t taxa = (dmp_pacotes * 1000UL) / DMP_SETTLE_MS;
+
+    Serial.printf("[DMP] Taxa de pacotes medida: ~%lu Hz (esperado ~100)\n",
+                  (unsigned long)taxa);
+
+    if (taxa < 80 || taxa > 120) {
+      Serial.println("[AVISO] Taxa do DMP fora do esperado.");
+    }
+  }
+  // V4: o pino INT esta ligado? (esperado ~100 interrupcoes/s, ~200 em 2 s)
+  {
+    const uint32_t n_int = int_count;
+
+    usa_int = (n_int >= 100);
+
+    Serial.printf("[DMP] Interrupcoes contadas: %lu -> disparo por %s\n",
+                  (unsigned long)n_int,
+                  usa_int ? "INTERRUPCAO" : "TIMER (INT nao detectada)");
+  }
+
   float a0 = 0.0f;
   float soma = 0.0f;
   int validas = 0;
@@ -1100,6 +1391,7 @@ bool inicializaRobo() {
 
   // Em operacao um travamento do I2C deve custar poucos ms, nao 100 ms.
   Wire.setTimeOut(8);
+  I2Cdev::readTimeout = 5;  // demais leituras via I2Cdev/DMP
 
   return true;
 }
@@ -1164,6 +1456,7 @@ void setup() {
   t_espera_ms = millis();
 
   prox_controle_us = micros() + TS_US;
+  ultimo_disparo_us = micros();
   ultimo_status_ms = millis();
   ultimoLogEnc_ms = millis();
 
@@ -1176,18 +1469,36 @@ void loop() {
 
   if (estado == SM_ESPERA_VERTICAL ||
       estado == SM_AUTOMATICO) {
-    atualizaIMU(false);
+    const uint32_t agora = micros();
+    bool disparo = false;
 
-    uint32_t agora = micros();
-
-    if ((int32_t)(agora - prox_controle_us) >= 0) {
-      prox_controle_us += TS_US;
-
-      if ((int32_t)(agora - prox_controle_us) >
-          (int32_t)(5 * TS_US)) {
-        prox_controle_us = agora + TS_US;
+    if (usa_int) {
+      // V4: o ciclo nasce do pacote do DMP -> dado sempre fresco, sem
+      // polling de I2C no loop(). Se a INT parar, o fallback assume.
+      if (mpuInterrupt) {
+        disparo = true;
+      } else if ((uint32_t)(agora - ultimo_disparo_us) >
+                 DISPARO_FALLBACK_US) {
+        disparo = true;
       }
+    } else {
+      // INT nao ligada: comportamento da versao anterior (timer + polling)
+      atualizaIMU(false);
 
+      if ((int32_t)(agora - prox_controle_us) >= 0) {
+        prox_controle_us += TS_US;
+
+        if ((int32_t)(agora - prox_controle_us) >
+            (int32_t)(5 * TS_US)) {
+          prox_controle_us = agora + TS_US;
+        }
+
+        disparo = true;
+      }
+    }
+
+    if (disparo) {
+      ultimo_disparo_us = agora;
       controle();
     }
 
