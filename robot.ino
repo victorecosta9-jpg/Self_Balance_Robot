@@ -8,7 +8,7 @@
 #include "driver/pcnt.h"
 
 // ============================================================
-// FW2 RESILIENTE - Auto-recuperação de FIFO & Barramento I2C
+// FW2 RESILIENTE - LQR + Yaw Diferencial Suave
 // ============================================================
 
 #define MOTORS_ENABLED 1
@@ -31,11 +31,16 @@
 #define PIN_ENC_DIR_A 35
 #define PIN_ENC_DIR_B 34
 
-// CONTROLE: GANHOS LQR
+// CONTROLE: GANHOS LQR (Equilíbrio e Posição)
 const float K_X = -6.9220f;
 const float K_THETA = -22.0804f;
 const float K_V = -14.3991f;
 const float K_W = -1.8563f;
+
+// CONTROLE: GANHOS DE ALINHAMENTO / YAW (Ação Diferencial Suave)
+// Comece com valores baixos para evitar choque com a zona morta (deadband)
+const float K_P_YAW = 2.0f;  // Se o robô ainda rodar devagar, suba para 3.0 ou 4.0
+const float K_D_YAW = 0.1f;  
 
 const float U_LIMIT_V = 11.1f;
 const float RAMP_S = 0.03f;
@@ -70,7 +75,7 @@ const uint32_t DMP_TIMEOUT_US = 100000;
 const float ANGLE_FALL_LIMIT_DEG = 60.0f;
 
 // PROTECOES
-const uint32_t EXT_MAX_CICLOS = 6;       // Tolerancia de extrapolacao com giroscopio
+const uint32_t EXT_MAX_CICLOS = 6;
 const uint8_t GLITCH_REJ_MAX = 2;
 const float OMEGA_MAX_RADS = 10.0f;
 const float OMEGA_SALTO_RADS = 6.0f;
@@ -391,7 +396,11 @@ int32_t pd_prev = 0;
 float pos = 0.0f;
 float vel = 0.0f;
 
-float hp[WIN_V];
+// Variáveis para estimativa individual por roda
+float pos_esq = 0.0f, pos_dir = 0.0f;
+float vel_esq = 0.0f, vel_dir = 0.0f;
+
+float hp_esq[WIN_V], hp_dir[WIN_V];
 uint32_t ht[WIN_V];
 uint32_t k = 0;
 
@@ -440,6 +449,10 @@ void iniciaControle() {
 
   pos = 0.0f;
   vel = 0.0f;
+  pos_esq = 0.0f;
+  pos_dir = 0.0f;
+  vel_esq = 0.0f;
+  vel_dir = 0.0f;
   k = 0;
 
   theta = 0.0f;
@@ -464,7 +477,8 @@ void iniciaControle() {
   t0_us = micros();
 
   for (int i = 0; i < WIN_V; i++) {
-    hp[i] = 0.0f;
+    hp_esq[i] = 0.0f;
+    hp_dir[i] = 0.0f;
     ht[i] = t0_us;
   }
 
@@ -560,7 +574,6 @@ void controle() {
 
   float theta_novo = -(wrap180(angulo - (angle_ref + TRIM_DEG)) * (PI / 180.0f));
 
-  // AUTO-RECUPERAÇÃO DA FIFO: Força reset na IMU se o pacote novo travar por 2 ciclos
   if (!pacote_novo) {
     ciclos_ext++;
 
@@ -601,6 +614,7 @@ void controle() {
     return;
   }
 
+  // ENCODERS INDIVIDUAIS
   atualizaEncoders();
 
   const int32_t pe = pulsosEsq;
@@ -612,26 +626,34 @@ void controle() {
   if (abs(dpe) > ENC_MAX_DELTA) dpe = 0;
   if (abs(dpd) > ENC_MAX_DELTA) dpd = 0;
 
-  pos += (dpe + dpd) * 0.5f * DIST_PER_PULSE;
+  pos_esq += dpe * DIST_PER_PULSE;
+  pos_dir += dpd * DIST_PER_PULSE;
+  pos = (pos_esq + pos_dir) * 0.5f;
 
   pe_prev = pe;
   pd_prev = pd;
 
+  // VELOCIDADES LINEARES INDIVIDUAIS
   const uint32_t idx = k % WIN_V;
 
   if (k >= WIN_V) {
     const float span = (uint32_t)(t_c - ht[idx]) * 1e-6f;
 
     if (span > 0.0f) {
-      float vel_nova = (pos - hp[idx]) / span;
+      float ve_nova = (pos_esq - hp_esq[idx]) / span;
+      float vd_nova = (pos_dir - hp_dir[idx]) / span;
 
-      if (fabsf(vel_nova - vel) > VEL_GLITCH_MPS) vel_nova = vel;
+      if (fabsf(ve_nova - vel_esq) > VEL_GLITCH_MPS) ve_nova = vel_esq;
+      if (fabsf(vd_nova - vel_dir) > VEL_GLITCH_MPS) vd_nova = vel_dir;
 
-      vel = fmaxf(-VEL_MAX_MPS, fminf(VEL_MAX_MPS, vel_nova));
+      vel_esq = fmaxf(-VEL_MAX_MPS, fminf(VEL_MAX_MPS, ve_nova));
+      vel_dir = fmaxf(-VEL_MAX_MPS, fminf(VEL_MAX_MPS, vd_nova));
+      vel = (vel_esq + vel_dir) * 0.5f;
     }
   }
 
-  hp[idx] = pos;
+  hp_esq[idx] = pos_esq;
+  hp_dir[idx] = pos_dir;
   ht[idx] = t_c;
 
   const float omega_nova = -GYRO_SIGN * (gx_raw / 16.4f) * (PI / 180.0f);
@@ -655,14 +677,22 @@ void controle() {
   const float t_s = (uint32_t)(t_c - t0_us) * 1e-6f;
   const float g_ramp = (RAMP_S <= 0.0f) ? 1.0f : fminf(1.0f, t_s / RAMP_S);
 
+  // LQR BASE DE EQUILÍBRIO
   float esforco = -(K_X * pos + K_THETA * theta + K_V * vel + K_W * omega);
-
   esforco = fmaxf(-12.0f, fminf(12.0f, esforco));
 
   float u = esforco * g_ramp;
-
   u = fmaxf(-U_LIMIT_V, fminf(U_LIMIT_V, u));
 
+  // MALHA DIFERENCIAL DE YAW (CORRIGIDA)
+  // delta_pos positivo significa que a roda esquerda andou MAIS que a direita.
+  // Para corrigir, tiramos tensão da esquerda e somamos na direita.
+  const float delta_pos = pos_esq - pos_dir;
+  const float delta_vel = vel_esq - vel_dir;
+
+  const float u_yaw = (K_P_YAW * delta_pos) + (K_D_YAW * delta_vel);
+
+  // PARADAS DE SEGURANCA
   ciclos_sat = (fabsf(u) >= U_LIMIT_V - 0.01f) ? ciclos_sat + 1 : 0;
   ciclos_vel_alta = (fabsf(vel) >= VEL_MAX_MPS - 0.01f) ? ciclos_vel_alta + 1 : 0;
 
@@ -677,8 +707,11 @@ void controle() {
     return;
   }
 
-  motorEsq.setVoltage(-u);
-  motorDir.setVoltage(u);
+  // ACIONAMENTO COM SINAL INVERTIDO/CORRETO
+  // Se ao rodar ele começar a girar em torno do próprio eixo feito pião, 
+  // inverta o sinal de u_yaw abaixo (-u + u_yaw e u + u_yaw)
+  motorEsq.setVoltage(-u + u_yaw);
+  motorDir.setVoltage(u + u_yaw);
 
   k++;
 }
@@ -791,7 +824,7 @@ bool inicializaRobo() {
 void setup() {
   pinMode(PIN_LED, OUTPUT);
   pinMode(PIN_BOOT, INPUT_PULLUP);
-  
+
   pinMode(3, INPUT_PULLUP);
 
   motorEsq.begin();
