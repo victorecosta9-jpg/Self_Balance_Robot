@@ -8,15 +8,9 @@
 #include "driver/pcnt.h"
 
 // ============================================================
-// FW2 LIMPO - mesma logica de controle do V4, sem diagnosticos.
-// Removido: buffer de log/CSV/relatorio, chaves DBG_*, rastreio de fase do
-// I2C, orcamento de I2C, driver IDF, contadores, caminho por interrupcao do
-// MPU (o pino INT nao esta ligado: o ciclo sempre nasce do timer de 10 ms),
-// AIR_TEST e a derivada de theta usada so para log.
-// Mantido: LQR, protecoes de seguranca, watchdog de ciclo, PCNT, DMP.
+// FW2 RESILIENTE - Auto-recuperação de FIFO & Barramento I2C
 // ============================================================
 
-// SEGURANCA (1 = motores ligados; use SOMENTE com robo suspenso/amarrado)
 #define MOTORS_ENABLED 1
 
 // PINOS
@@ -52,14 +46,14 @@ const float TRIM_DEG = 0.0f;
 const float TS = 0.01f;
 const uint32_t TS_US = 10000;
 
-// Sinais (validados no teste no ar)
+// Sinais
 const float ANGLE_SIGN = -1.0f;
 const float GYRO_SIGN = -1.0f;
 
 // MOTORES / RODAS
 const float VBAT_V = 11.1f;
 const float WHEEL_DIAMETER_M = 0.0683f;
-const float PULSES_PER_REV = 836.0f;  // 209 x 4 (quadratura)
+const float PULSES_PER_REV = 836.0f;
 const float DIST_PER_PULSE = (PI * WHEEL_DIAMETER_M) / PULSES_PER_REV;
 
 const float DEADBAND_V = 0.65f;
@@ -72,40 +66,38 @@ const float DEADBAND_RAMP_V = 1.5f;
 // IMU
 #define I2C_FREQ_HZ 400000
 
-const uint32_t DMP_TIMEOUT_US = 30000;
+const uint32_t DMP_TIMEOUT_US = 100000;
 const float ANGLE_FALL_LIMIT_DEG = 60.0f;
 
 // PROTECOES
-const uint32_t EXT_MAX_CICLOS = 2;       // ciclos seguidos sem pacote novo antes de parar
-const uint8_t GLITCH_REJ_MAX = 2;        // rejeicoes seguidas antes de aceitar o novo valor
+const uint32_t EXT_MAX_CICLOS = 6;       // Tolerancia de extrapolacao com giroscopio
+const uint8_t GLITCH_REJ_MAX = 2;
 const float OMEGA_MAX_RADS = 10.0f;
 const float OMEGA_SALTO_RADS = 6.0f;
 const uint8_t QUEDA_CICLOS = 3;
 const float GLITCH_THETA_DEG = 8.0f;
 const float VEL_MAX_MPS = 1.5f;
 const float VEL_GLITCH_MPS = 0.6f;
-const int32_t ENC_MAX_DELTA = 120;       // contagens/ciclo (fisico max ~74)
+const int32_t ENC_MAX_DELTA = 120;
 const float POS_MAX_M = 1.0f;
-const uint32_t SAT_MAX_CICLOS = 30;      // 300 ms saturado => para
-const uint32_t VEL_ALTA_MAX_CICLOS = 50; // 500 ms em VEL_MAX => para
+const uint32_t SAT_MAX_CICLOS = 30;
+const uint32_t VEL_ALTA_MAX_CICLOS = 50;
 const float START_WINDOW_DEG = 5.0f;
 const int START_OK_SAMPLES = 20;
 const uint32_t START_TIMEOUT_MS = 5000;
 const uint32_t DMP_SETTLE_MS = 2000;
 const int REF_SAMPLES = 100;
 
-// Saude do I2C: ciclo com I2C acima disso e "suspeito"; mais de
-// I2C_CONSEC_MAX seguidos => para.
-const uint32_t I2C_SUSPEITO_US = 3000;
-const uint32_t I2C_CONSEC_MAX = 5;
+const uint32_t I2C_SUSPEITO_US = 4000;
+const uint32_t I2C_CONSEC_MAX = 8;
 
-const uint32_t WATCHDOG_US = 40000;  // controle() parado por mais que isso => motores param
+const uint32_t WATCHDOG_US = 40000;
 
 enum Estado { SM_INICIALIZANDO, SM_ESPERA_VERTICAL, SM_AUTOMATICO, SM_PARADO };
 Estado estado = SM_INICIALIZANDO;
 
 // ============================================================
-// MOTOR (ponte H TB6612FNG)
+// MOTOR
 // ============================================================
 class Motor {
  public:
@@ -141,8 +133,6 @@ class Motor {
       return;
     }
 
-    // zona morta suavizada: acima de DEADBAND_RAMP_V o motor recebe a tensao
-    // pedida mais DEADBAND_V de compensacao
     const float eff = DEADBAND_V * fminf(1.0f, a / DEADBAND_RAMP_V) +
                       (a / VBAT_V) * (VBAT_V - DEADBAND_V);
 
@@ -181,7 +171,7 @@ Motor motorEsq(PIN_M_ESQ_PWM, PIN_M_ESQ_IN1, PIN_M_ESQ_IN2, 0);
 Motor motorDir(PIN_M_DIR_PWM, PIN_M_DIR_IN1, PIN_M_DIR_IN2, 1);
 
 // ============================================================
-// WATCHDOG DE CICLO (timer independente do loop())
+// WATCHDOG DE CICLO
 // ============================================================
 volatile uint32_t ultimo_ciclo_us = 0;
 volatile bool watchdog_ativo = false;
@@ -196,9 +186,7 @@ static void watchdogCb(void*) {
 }
 
 // ============================================================
-// ENCODERS: quadratura 4x por hardware (PCNT), filtro de glitch de 12.8 us
-//  canal 0: pulso=A, controle=B (B baixo inverte)
-//  canal 1: pulso=B, controle=A (A alto inverte)
+// ENCODERS (PCNT)
 // ============================================================
 volatile int32_t pulsosEsq = 0;
 volatile int32_t pulsosDir = 0;
@@ -236,7 +224,6 @@ static void pcntInit(pcnt_unit_t unit, int pinA, int pinB) {
 static int16_t pcntUltEsq = 0;
 static int16_t pcntUltDir = 0;
 
-// Chamar a cada ciclo (o contador de hardware e de 16 bits).
 void atualizaEncoders() {
   int16_t ce = 0, cd = 0;
 
@@ -250,7 +237,7 @@ void atualizaEncoders() {
   pcntUltDir = cd;
 
   pulsosEsq = pulsosEsq + de;
-  pulsosDir = pulsosDir - dd;  // direita: sinal oposto
+  pulsosDir = pulsosDir - dd;
 }
 
 // ============================================================
@@ -277,35 +264,26 @@ static inline float wrap180(float a) {
   return a;
 }
 
-// Le um pacote da FIFO do DMP. true = pacote novo valido em dmp_roll_deg.
 bool lerFIFO() {
   if (packetSize == 0) return false;
 
   uint16_t n = mpu.getFIFOCount();
 
-  if (n >= 1024) {  // overflow
-    mpu.resetFIFO();
+  if (n >= 1024 || n < packetSize) {
+    if (n >= 1024) mpu.resetFIFO();
     return false;
   }
 
-  if (n < packetSize) return false;
-
-  // FIFO muito atrasada (3+ pacotes): re-sincroniza
   if (n >= (uint16_t)(packetSize * 3)) {
     mpu.resetFIFO();
     return false;
   }
 
-  // 2 pacotes: descarta so o mais antigo
   if (n >= (uint16_t)(packetSize * 2)) {
     mpu.getFIFOBytes(fifoBuffer, packetSize);
     n -= packetSize;
   }
 
-  if (n < packetSize) return false;
-
-  // Leitura checando o retorno: timeout no meio do pacote desalinha a FIFO,
-  // entao descarta tudo e re-sincroniza.
   const int8_t lidos = I2Cdev::readBytes(MPU6050_ADDRESS_AD0_LOW,
                                          MPU6050_RA_FIFO_R_W,
                                          (uint8_t)packetSize, fifoBuffer);
@@ -317,7 +295,6 @@ bool lerFIFO() {
 
   mpu.dmpGetQuaternion(&q, fifoBuffer);
 
-  // quaternion unitario: se a norma estiver errada o pacote e lixo
   const float nq = q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z;
 
   if (nq < 0.95f || nq > 1.05f) {
@@ -335,8 +312,6 @@ bool lerFIFO() {
   return true;
 }
 
-// forcar=false: consulta a FIFO no maximo a cada 1 ms (chamada do loop()).
-// forcar=true: consulta sempre (chamada dentro de controle()).
 bool atualizaIMU(bool forcar) {
   const uint32_t agora = micros();
 
@@ -346,7 +321,6 @@ bool atualizaIMU(bool forcar) {
   return lerFIFO();
 }
 
-// Recupera um barramento I2C travado (SDA preso em baixo): 9 pulsos de SCL + STOP.
 void i2cBusRecover() {
   pinMode(PIN_I2C_SCL, OUTPUT_OPEN_DRAIN);
   pinMode(PIN_I2C_SDA, OUTPUT_OPEN_DRAIN);
@@ -378,7 +352,7 @@ bool iniciaI2cEMpu() {
   for (int tentativa = 0; tentativa < 3; tentativa++) {
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
     Wire.setClock(I2C_FREQ_HZ);
-    Wire.setTimeOut(100);
+    Wire.setTimeOut(2);
 
     mpu.initialize();
 
@@ -404,8 +378,8 @@ float angle_ref = 0.0f;
 
 float theta = 0.0f;
 float omega = 0.0f;
-float omega_prev_ctrl = 0.0f;  // omega do ciclo anterior (para extrapolar)
-float omega_ok = 0.0f;         // ultimo omega aceito
+float omega_prev_ctrl = 0.0f;
+float omega_ok = 0.0f;
 uint8_t rej_omega = 0;
 
 float theta_valido = 0.0f;
@@ -522,15 +496,12 @@ void controle() {
     return;
   }
 
-  // Leituras I2C do ciclo: FIFO do DMP (angulo) + giroscopio bruto (omega)
   atualizaIMU(true);
 
-  // Giroscopio bruto, eixo X (+-2000 dps => 16.4 LSB/dps)
   const int16_t gx_raw = mpu.getRotationX();
 
   const uint32_t t_c = micros();
 
-  // Saude do I2C: ciclo lento => omega mantida; muitos seguidos => para
   const bool i2c_suspeito = (t_c - t_entrada) > I2C_SUSPEITO_US;
 
   if (i2c_suspeito) {
@@ -556,7 +527,6 @@ void controle() {
 
   const float angulo = ANGLE_SIGN * dmp_roll_deg;
 
-  // Espera o robo ficar na vertical antes de iniciar o controle
   if (estado == SM_ESPERA_VERTICAL) {
     if (fabsf(wrap180(angulo - angle_ref)) < START_WINDOW_DEG) {
       ok_vertical++;
@@ -573,7 +543,6 @@ void controle() {
     return;
   }
 
-  // Periodo real entre execucoes
   if (!primeiro_ciclo) {
     const float dt = (uint32_t)(t_entrada - t_entrada_ant_us) * 1e-6f;
 
@@ -586,16 +555,18 @@ void controle() {
   primeiro_ciclo = false;
   t_entrada_ant_us = t_entrada;
 
-  // ANGULO: theta = -(roll - (referencia + trim)), em radianos
   const bool pacote_novo = (dmp_pacotes != pacote_usado);
   pacote_usado = dmp_pacotes;
 
   float theta_novo = -(wrap180(angulo - (angle_ref + TRIM_DEG)) * (PI / 180.0f));
 
-  // Sem pacote novo: dmp_roll_deg esta velho. Extrapola com o giroscopio por
-  // no maximo EXT_MAX_CICLOS ciclos.
+  // AUTO-RECUPERAÇÃO DA FIFO: Força reset na IMU se o pacote novo travar por 2 ciclos
   if (!pacote_novo) {
     ciclos_ext++;
+
+    if (ciclos_ext >= 2) {
+      mpu.resetFIFO();
+    }
 
     if (ciclos_ext > EXT_MAX_CICLOS) {
       parar("imu_sem_pacote");
@@ -609,8 +580,6 @@ void controle() {
     ciclos_ext = 0;
   }
 
-  // Filtro de glitch: rejeita salto impossivel de theta em 1 ciclo, no maximo
-  // GLITCH_REJ_MAX ciclos seguidos.
   if (pacote_novo && theta_valido_ok && rej_theta < GLITCH_REJ_MAX &&
       fabsf(theta_novo - theta_valido) > GLITCH_THETA_DEG * (PI / 180.0f)) {
     rej_theta++;
@@ -623,7 +592,6 @@ void controle() {
   theta_valido = theta_novo;
   theta_valido_ok = true;
 
-  // Protecao contra queda (exige persistencia)
   const float theta_deg = fabsf(theta) * (180.0f / PI);
 
   cont_queda = (theta_deg > ANGLE_FALL_LIMIT_DEG) ? cont_queda + 1 : 0;
@@ -633,8 +601,6 @@ void controle() {
     return;
   }
 
-  // POSICAO (encoders). Rajada acima do limite fisico por ciclo e ruido:
-  // descarta na origem para nao integrar o erro.
   atualizaEncoders();
 
   const int32_t pe = pulsosEsq;
@@ -651,7 +617,6 @@ void controle() {
   pe_prev = pe;
   pd_prev = pd;
 
-  // VELOCIDADE LINEAR: variacao da posicao numa janela de WIN_V ciclos
   const uint32_t idx = k % WIN_V;
 
   if (k >= WIN_V) {
@@ -669,9 +634,6 @@ void controle() {
   hp[idx] = pos;
   ht[idx] = t_c;
 
-  // VELOCIDADE ANGULAR: giroscopio bruto. Valor impossivel ou salto brusco
-  // indica leitura corrompida: mantem o ultimo valido (no maximo
-  // GLITCH_REJ_MAX ciclos seguidos).
   const float omega_nova = -GYRO_SIGN * (gx_raw / 16.4f) * (PI / 180.0f);
 
   const bool omega_suspeita =
@@ -690,11 +652,9 @@ void controle() {
 
   omega_prev_ctrl = omega;
 
-  // RAMPA INICIAL
   const float t_s = (uint32_t)(t_c - t0_us) * 1e-6f;
   const float g_ramp = (RAMP_S <= 0.0f) ? 1.0f : fminf(1.0f, t_s / RAMP_S);
 
-  // LQR: u = -(Kx*pos + Ktheta*theta + Kv*vel + Kw*omega), em volts
   float esforco = -(K_X * pos + K_THETA * theta + K_V * vel + K_W * omega);
 
   esforco = fmaxf(-12.0f, fminf(12.0f, esforco));
@@ -703,7 +663,6 @@ void controle() {
 
   u = fmaxf(-U_LIMIT_V, fminf(U_LIMIT_V, u));
 
-  // PARADAS DE SEGURANCA
   ciclos_sat = (fabsf(u) >= U_LIMIT_V - 0.01f) ? ciclos_sat + 1 : 0;
   ciclos_vel_alta = (fabsf(vel) >= VEL_MAX_MPS - 0.01f) ? ciclos_vel_alta + 1 : 0;
 
@@ -718,7 +677,6 @@ void controle() {
     return;
   }
 
-  // ACIONAMENTO
   motorEsq.setVoltage(-u);
   motorDir.setVoltage(u);
 
@@ -726,7 +684,7 @@ void controle() {
 }
 
 // ============================================================
-// SERIAL: 'm' = parada manual, 'a' = reiniciar depois de parado
+// SERIAL
 // ============================================================
 void trataSerial() {
   while (Serial.available() > 0) {
@@ -787,7 +745,6 @@ bool inicializaRobo() {
     delay(1);
   }
 
-  // Referencia de angulo: media de REF_SAMPLES pacotes
   float a0 = 0.0f;
   float soma = 0.0f;
   int validas = 0;
@@ -825,9 +782,6 @@ bool inicializaRobo() {
   pcntInit(PCNT_UNIT_0, PIN_ENC_ESQ_A, PIN_ENC_ESQ_B);
   pcntInit(PCNT_UNIT_1, PIN_ENC_DIR_A, PIN_ENC_DIR_B);
 
-  // Em operacao um travamento do I2C deve custar poucos ms, nao 100 ms.
-  Wire.setTimeOut(8);
-
   return true;
 }
 
@@ -837,16 +791,11 @@ bool inicializaRobo() {
 void setup() {
   pinMode(PIN_LED, OUTPUT);
   pinMode(PIN_BOOT, INPUT_PULLUP);
+  
+  pinMode(3, INPUT_PULLUP);
 
   motorEsq.begin();
   motorDir.begin();
-
-  esp_timer_create_args_t wdArgs = {};
-  wdArgs.callback = &watchdogCb;
-  wdArgs.name = "wd_ciclo";
-  esp_timer_handle_t wdTimer;
-  esp_timer_create(&wdArgs, &wdTimer);
-  esp_timer_start_periodic(wdTimer, 10000);
 
   Serial.begin(115200);
   delay(500);
@@ -874,6 +823,13 @@ void setup() {
     return;
   }
 
+  esp_timer_create_args_t wdArgs = {};
+  wdArgs.callback = &watchdogCb;
+  wdArgs.name = "wd_ciclo";
+  esp_timer_handle_t wdTimer;
+  esp_timer_create(&wdArgs, &wdTimer);
+  esp_timer_start_periodic(wdTimer, 10000);
+
   Serial.println("[BOOT] Segure o robo na vertical.");
 
   ok_vertical = 0;
@@ -889,13 +845,11 @@ void loop() {
   if (estado == SM_ESPERA_VERTICAL || estado == SM_AUTOMATICO) {
     const uint32_t agora = micros();
 
-    // Mantem a FIFO do DMP sendo lida entre os ciclos de controle
     atualizaIMU(false);
 
     if ((int32_t)(agora - prox_controle_us) >= 0) {
       prox_controle_us += TS_US;
 
-      // se atrasou mais de 5 periodos, re-ancora em vez de disparar em rajada
       if ((int32_t)(agora - prox_controle_us) > (int32_t)(5 * TS_US)) {
         prox_controle_us = agora + TS_US;
       }
