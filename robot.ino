@@ -7,14 +7,14 @@
 #include "esp_timer.h"
 #include "driver/pcnt.h"
 
-// LEITURA BLE LEVE
+// LEITURA BLE NATIVA DO ESP32
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
 
 // ============================================================
-// FW2 RESILIENTE - Sentido Invertido + Rampa Rápida e Suave (BLE Fix)
+// FW2 RESILIENTE - Teste de Resposta + Anotações MQTT para Kaique
 // ============================================================
 
 #define MOTORS_ENABLED 1
@@ -52,7 +52,7 @@ const float K_V = -14.3991f;
 const float K_W = -1.8563f;
 
 // YAW E MOBILIDADE
-const float VEL_RAMPA_MPS = 1.20f; // Aumentado para 1.2 m/s (Movimento rápido e decidido)
+const float VEL_RAMPA_MPS = 1.20f; // Avanço rápido (1.2 m/s)
 const float PASSO_GIRO = 2.0f;     // Tensão de giro suave [Volts]
 
 const float U_LIMIT_V = 11.1f;
@@ -82,13 +82,11 @@ const float DEADBAND_RAMP_V = 1.5f;
 #define I2C_FREQ_HZ 400000
 
 const uint32_t DMP_TIMEOUT_US = 100000;
-const float ANGLE_FALL_LIMIT_DEG = 60.0f;
 
 const uint32_t EXT_MAX_CICLOS = 6;
 const uint8_t GLITCH_REJ_MAX = 2;
 const float OMEGA_MAX_RADS = 10.0f;
 const float OMEGA_SALTO_RADS = 6.0f;
-const uint8_t QUEDA_CICLOS = 3;
 const float GLITCH_THETA_DEG = 8.0f;
 const float VEL_MAX_MPS = 1.8f;
 const float VEL_GLITCH_MPS = 0.6f;
@@ -115,8 +113,12 @@ volatile float cmd_giro = 0.0f;
 volatile int modo_movimento = 0; // 0: Manter Posição, 1: Frente, 2: Ré, 3: Zero Absoluto
 volatile uint32_t t_ultimo_pacote_ms = 0;
 
+// CONTROLE DO TESTE DE QUEDA DA CONDIÇÃO INICIAL (BOTAO QUADRADO)
+volatile bool aguardando_queda_20deg = false;
+uint32_t t_inicio_teste_ms = 0;
+
 // ============================================================
-// CALLBACKS BLE - PARSER DABBLE AJUSTADO
+// CALLBACKS BLE - BOTAO QUADRADO DISPARA O TESTE DE QUEDA
 // ============================================================
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
@@ -127,6 +129,7 @@ class MyServerCallbacks: public BLEServerCallbacks {
       deviceConnected = false;
       modo_movimento = 0;
       cmd_giro = 0.0f;
+      aguardando_queda_20deg = false;
       BLEDevice::startAdvertising();
     }
 };
@@ -140,15 +143,20 @@ class MyCallbacks: public BLECharacteristicCallbacks {
       uint8_t* data = (uint8_t*)rxValue.c_str();
 
       if (len >= 7 && data[0] == 0xFF) {
-        uint8_t btn_forma = data[5]; // Botões geométricos (X)
+        uint8_t btn_forma = data[5]; // Botões geométricos (Quadrado, X)
         uint8_t btn_setas = data[6]; // Setas direcionais
 
-        // 1. CHECA BOTAO X (0x10 em data[5])
-        if (btn_forma & 0x10) {
+        // 1. CHECA BOTAO QUADRADO (0x20 em data[5]) -> INICIA TESTE DE QUEDA
+        if (btn_forma & 0x20) {
+          aguardando_queda_20deg = true;
+          Serial.println("\n--- INICIANDO TESTE: DEIXANDO CAIR ATE O ANGULO DEFINIDO ---");
+        }
+        // 2. CHECA BOTAO X (0x10 em data[5]) -> ZERO ABSOLUTO
+        else if (btn_forma & 0x10) {
           modo_movimento = 3;
           cmd_giro = 0.0f;
         } 
-        // 2. CHECA SETAS DIRECIONAIS (data[6])
+        // 3. CHECA SETAS DIRECIONAIS (data[6])
         else if (btn_setas & 0x01) {       // Seta Cima -> Avançar
           modo_movimento = 1;
           cmd_giro = 0.0f;
@@ -168,7 +176,11 @@ class MyCallbacks: public BLECharacteristicCallbacks {
       } 
       else if (len == 1) {
         char c = rxValue[0];
-        if (c == 'F') { modo_movimento = 1; cmd_giro = 0.0f; }
+        if (c == 'S' || c == 'q') { 
+          aguardando_queda_20deg = true; 
+          Serial.println("\n--- INICIANDO TESTE: DEIXANDO CAIR ATE O ANGULO DEFINIDO ---");
+        }
+        else if (c == 'F') { modo_movimento = 1; cmd_giro = 0.0f; }
         else if (c == 'B') { modo_movimento = 2; cmd_giro = 0.0f; }
         else if (c == 'L') { modo_movimento = 0; cmd_giro = -PASSO_GIRO; }
         else if (c == 'R') { modo_movimento = 0; cmd_giro = PASSO_GIRO; }
@@ -484,7 +496,6 @@ uint32_t pacote_usado = 0;
 uint32_t ciclos_ext = 0;
 uint32_t i2c_consec = 0;
 
-uint8_t cont_queda = 0;
 uint32_t ciclos_sat = 0;
 uint32_t ciclos_vel_alta = 0;
 
@@ -546,7 +557,6 @@ void iniciaControle() {
   pacote_usado = dmp_pacotes;
   i2c_consec = 0;
 
-  cont_queda = 0;
   ciclos_sat = 0;
   ciclos_vel_alta = 0;
 
@@ -683,13 +693,26 @@ void controle() {
   theta_valido = theta_novo;
   theta_valido_ok = true;
 
-  const float theta_deg = fabsf(theta) * (180.0f / PI);
+  // KAIQUE, RETIRE ESSA INFORMAÇÃO PARA O MQTT: ÂNGULO EM GRAUS (theta_deg)
+  const float theta_deg = theta * (180.0f / PI);
 
-  cont_queda = (theta_deg > ANGLE_FALL_LIMIT_DEG) ? cont_queda + 1 : 0;
+  // ============================================================
+  // LOGICA DO TESTE DE QUEDA LIVRE (|theta_deg| >= 20.0f)
+  // ============================================================
+  if (aguardando_queda_20deg) {
+    motorEsq.stop();
+    motorDir.stop();
 
-  if (cont_queda >= QUEDA_CICLOS) {
-    parar("queda");
-    return;
+    Serial.printf("MODO_TESTE,%.2f\n", theta_deg);
+
+    if (fabsf(theta_deg) >= 20.0f) { // <-- Altere o valor limite de disparo do teste aqui se quiser
+      aguardando_queda_20deg = false;
+      t_inicio_teste_ms = millis();
+      x_ref = pos; 
+      Serial.println("--- ANGULO LIMITE ATINGIDO! LQR REASSUMINDO ---");
+      Serial.println("Tempo_ms,Theta_deg,Omega_deg_s,Posicao_m,Velocidade_m_s,Esforco_V");
+    }
+    return; // Pula o LQR enquanto cai
   }
 
   atualizaEncoders();
@@ -706,27 +729,28 @@ void controle() {
   pos_esq += dpe * DIST_PER_PULSE;
   pos_dir += dpd * DIST_PER_PULSE;
 
+  // KAIQUE, RETIRE ESSA INFORMAÇÃO PARA O MQTT: POSIÇÃO LINEAR EM METROS (pos)
   pos = (pos_esq + pos_dir) * 0.5f;
 
   pe_prev = pe;
   pd_prev = pd;
 
-  // WATCHDOG BLE AMPLIADO PARA MANTER MOVIMENTO FLUIDO AO SEGURAR
+  // WATCHDOG BLE
   if (millis() - t_ultimo_pacote_ms > 400) {
     modo_movimento = 0;
     cmd_giro = 0.0f;
   }
 
-  // ATUALIZAÇÃO DA REFERÊNCIA X_REF (SENTIDOS CORRIGIDOS)
-  if (modo_movimento == 1) {        // Seta Cima -> Avançar para Frente
+  // ATUALIZAÇÃO DA REFERÊNCIA X_REF
+  if (modo_movimento == 1) {        // Avançar (Frente)
     x_ref += VEL_RAMPA_MPS * TS;
-  } else if (modo_movimento == 2) { // Seta Baixo -> Recuar (Ré)
+  } else if (modo_movimento == 2) { // Recuar (Ré)
     x_ref -= VEL_RAMPA_MPS * TS;
   } else if (modo_movimento == 3) { // Zero Absoluto (Botão X)
     x_ref = 0.0f;
-  } else {                          // Mantém a Posição Atual
+  } else {                          // Mantém Posição
     if (cmd_giro != 0.0f) {
-      x_ref = pos;                  // Atualiza a referência de posição no meio do giro
+      x_ref = pos;                  
     }
   }
 
@@ -744,6 +768,8 @@ void controle() {
 
       vel_esq = fmaxf(-VEL_MAX_MPS, fminf(VEL_MAX_MPS, ve_nova));
       vel_dir = fmaxf(-VEL_MAX_MPS, fminf(VEL_MAX_MPS, vd_nova));
+
+      // KAIQUE, RETIRE ESSA INFORMAÇÃO PARA O MQTT: VELOCIDADE LINEAR EM M/S (vel)
       vel = (vel_esq + vel_dir) * 0.5f;
     }
   }
@@ -770,6 +796,9 @@ void controle() {
 
   omega_prev_ctrl = omega;
 
+  // KAIQUE, RETIRE ESSA INFORMAÇÃO PARA O MQTT: VELOCIDADE ANGULAR EM GRAUS/S (omega_deg_s)
+  const float omega_deg_s = omega * (180.0f / PI);
+
   const float t_s = (uint32_t)(t_c - t0_us) * 1e-6f;
   const float g_ramp = (RAMP_S <= 0.0f) ? 1.0f : fminf(1.0f, t_s / RAMP_S);
 
@@ -779,10 +808,22 @@ void controle() {
   float esforco = -(K_X * erro_pos + K_THETA * theta + K_V * vel + K_W * omega);
   esforco = fmaxf(-12.0f, fminf(12.0f, esforco));
 
+  // KAIQUE, RETIRE ESSA INFORMAÇÃO PARA O MQTT: ESFORÇO DE CONTROLE EM VOLTS (u)
   float u = esforco * g_ramp;
   u = fmaxf(-U_LIMIT_V, fminf(U_LIMIT_V, u));
 
-  // APLICAÇÃO SUAVE DE GIRO YAW
+  // KAIQUE, RETIRE ESSA INFORMAÇÃO PARA O MQTT: IMPRESSÃO DOS DADOS COMPLETOS PARA A DASHBOARD / MATLAB
+  if (t_inicio_teste_ms > 0) {
+    uint32_t t_rel = millis() - t_inicio_teste_ms;
+    Serial.printf("%lu,%.4f,%.4f,%.4f,%.4f,%.4f\n", t_rel, theta_deg, omega_deg_s, pos, vel, u);
+
+    if (t_rel > 3000) { // Registra por 3 segundos de teste
+      t_inicio_teste_ms = 0;
+      Serial.println("--- TESTE CONCLUIDO ---");
+    }
+  }
+
+  // APLICAÇÃO DE GIRO SUAVE
   const float u_esq = -u - cmd_giro;
   const float u_dir =  u - cmd_giro;
 
@@ -935,7 +976,7 @@ void setup() {
   pServer->getAdvertising()->start();
 
   Serial.println();
-  Serial.printf("=== PENDULO INVERTIDO ESP32 | Sentido e Mobilidade Rápida OK ===\n");
+  Serial.printf("=== PENDULO INVERTIDO ESP32 | Comentarios MQTT Configurados ===\n");
 
   if (digitalRead(PIN_BOOT) == LOW) {
     Serial.println("[CANCELADO] Botao BOOT pressionado.");
@@ -960,7 +1001,6 @@ void setup() {
   wdArgs.callback = &watchdogCb;
   wdArgs.name = "wd_ciclo";
   esp_timer_handle_t wdTimer;
-  esp_timer_create(&wdArgs, &wdTimer);
   esp_timer_start_periodic(wdTimer, 10000);
 
   Serial.println("[BOOT] Segure o robo na vertical.");
