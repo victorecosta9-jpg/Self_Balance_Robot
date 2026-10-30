@@ -7,11 +7,25 @@
 #include "esp_timer.h"
 #include "driver/pcnt.h"
 
+// LEITURA BLE LEVE
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
 // ============================================================
-// FW2 RESILIENTE - LQR + Yaw Diferencial Suave
+// FW2 RESILIENTE - Sentido Invertido + Rampa Rápida e Suave (BLE Fix)
 // ============================================================
 
 #define MOTORS_ENABLED 1
+
+#define SERVICE_UUID           "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_UUID_TX "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+
+BLEServer *pServer = NULL;
+BLECharacteristic *pTxCharacteristic;
+bool deviceConnected = false;
 
 // PINOS
 #define PIN_I2C_SCL 22
@@ -31,16 +45,15 @@
 #define PIN_ENC_DIR_A 35
 #define PIN_ENC_DIR_B 34
 
-// CONTROLE: GANHOS LQR (Equilíbrio e Posição)
+// CONTROLE: GANHOS LQR
 const float K_X = -6.9220f;
 const float K_THETA = -22.0804f;
 const float K_V = -14.3991f;
 const float K_W = -1.8563f;
 
-// CONTROLE: GANHOS DE ALINHAMENTO / YAW (Ação Diferencial Suave)
-// Comece com valores baixos para evitar choque com a zona morta (deadband)
-const float K_P_YAW = 2.0f;  // Se o robô ainda rodar devagar, suba para 3.0 ou 4.0
-const float K_D_YAW = 0.1f;  
+// YAW E MOBILIDADE
+const float VEL_RAMPA_MPS = 1.20f; // Aumentado para 1.2 m/s (Movimento rápido e decidido)
+const float PASSO_GIRO = 2.0f;     // Tensão de giro suave [Volts]
 
 const float U_LIMIT_V = 11.1f;
 const float RAMP_S = 0.03f;
@@ -51,11 +64,9 @@ const float TRIM_DEG = 0.0f;
 const float TS = 0.01f;
 const uint32_t TS_US = 10000;
 
-// Sinais
 const float ANGLE_SIGN = -1.0f;
 const float GYRO_SIGN = -1.0f;
 
-// MOTORES / RODAS
 const float VBAT_V = 11.1f;
 const float WHEEL_DIAMETER_M = 0.0683f;
 const float PULSES_PER_REV = 836.0f;
@@ -68,23 +79,21 @@ const float DEADBAND_RAMP_V = 1.5f;
 #define PWM_BITS 10
 #define PWM_MAX ((1 << PWM_BITS) - 1)
 
-// IMU
 #define I2C_FREQ_HZ 400000
 
 const uint32_t DMP_TIMEOUT_US = 100000;
 const float ANGLE_FALL_LIMIT_DEG = 60.0f;
 
-// PROTECOES
 const uint32_t EXT_MAX_CICLOS = 6;
 const uint8_t GLITCH_REJ_MAX = 2;
 const float OMEGA_MAX_RADS = 10.0f;
 const float OMEGA_SALTO_RADS = 6.0f;
 const uint8_t QUEDA_CICLOS = 3;
 const float GLITCH_THETA_DEG = 8.0f;
-const float VEL_MAX_MPS = 1.5f;
+const float VEL_MAX_MPS = 1.8f;
 const float VEL_GLITCH_MPS = 0.6f;
 const int32_t ENC_MAX_DELTA = 120;
-const float POS_MAX_M = 1.0f;
+const float POS_MAX_M = 5.0f; 
 const uint32_t SAT_MAX_CICLOS = 30;
 const uint32_t VEL_ALTA_MAX_CICLOS = 50;
 const float START_WINDOW_DEG = 5.0f;
@@ -100,6 +109,74 @@ const uint32_t WATCHDOG_US = 40000;
 
 enum Estado { SM_INICIALIZANDO, SM_ESPERA_VERTICAL, SM_AUTOMATICO, SM_PARADO };
 Estado estado = SM_INICIALIZANDO;
+
+volatile float x_ref = 0.0f;
+volatile float cmd_giro = 0.0f;
+volatile int modo_movimento = 0; // 0: Manter Posição, 1: Frente, 2: Ré, 3: Zero Absoluto
+volatile uint32_t t_ultimo_pacote_ms = 0;
+
+// ============================================================
+// CALLBACKS BLE - PARSER DABBLE AJUSTADO
+// ============================================================
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+      deviceConnected = true;
+    };
+
+    void onDisconnect(BLEServer* pServer) {
+      deviceConnected = false;
+      modo_movimento = 0;
+      cmd_giro = 0.0f;
+      BLEDevice::startAdvertising();
+    }
+};
+
+class MyCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+      String rxValue = pCharacteristic->getValue();
+      t_ultimo_pacote_ms = millis();
+
+      uint8_t len = rxValue.length();
+      uint8_t* data = (uint8_t*)rxValue.c_str();
+
+      if (len >= 7 && data[0] == 0xFF) {
+        uint8_t btn_forma = data[5]; // Botões geométricos (X)
+        uint8_t btn_setas = data[6]; // Setas direcionais
+
+        // 1. CHECA BOTAO X (0x10 em data[5])
+        if (btn_forma & 0x10) {
+          modo_movimento = 3;
+          cmd_giro = 0.0f;
+        } 
+        // 2. CHECA SETAS DIRECIONAIS (data[6])
+        else if (btn_setas & 0x01) {       // Seta Cima -> Avançar
+          modo_movimento = 1;
+          cmd_giro = 0.0f;
+        } else if (btn_setas & 0x02) { // Seta Baixo -> Recuar
+          modo_movimento = 2;
+          cmd_giro = 0.0f;
+        } else if (btn_setas & 0x04) { // Esquerda -> Giro Suave
+          modo_movimento = 0;
+          cmd_giro = -PASSO_GIRO;
+        } else if (btn_setas & 0x08) { // Direita -> Giro Suave
+          modo_movimento = 0;
+          cmd_giro = PASSO_GIRO;
+        } else {                       // Solto
+          modo_movimento = 0;
+          cmd_giro = 0.0f;
+        }
+      } 
+      else if (len == 1) {
+        char c = rxValue[0];
+        if (c == 'F') { modo_movimento = 1; cmd_giro = 0.0f; }
+        else if (c == 'B') { modo_movimento = 2; cmd_giro = 0.0f; }
+        else if (c == 'L') { modo_movimento = 0; cmd_giro = -PASSO_GIRO; }
+        else if (c == 'R') { modo_movimento = 0; cmd_giro = PASSO_GIRO; }
+        else if (c == 'X') { modo_movimento = 3; cmd_giro = 0.0f; }
+        else { modo_movimento = 0; cmd_giro = 0.0f; }
+      }
+    }
+};
 
 // ============================================================
 // MOTOR
@@ -396,7 +473,6 @@ int32_t pd_prev = 0;
 float pos = 0.0f;
 float vel = 0.0f;
 
-// Variáveis para estimativa individual por roda
 float pos_esq = 0.0f, pos_dir = 0.0f;
 float vel_esq = 0.0f, vel_dir = 0.0f;
 
@@ -448,9 +524,11 @@ void iniciaControle() {
   pd_prev = pulsosDir;
 
   pos = 0.0f;
-  vel = 0.0f;
   pos_esq = 0.0f;
   pos_dir = 0.0f;
+  x_ref = 0.0f; 
+  
+  vel = 0.0f;
   vel_esq = 0.0f;
   vel_dir = 0.0f;
   k = 0;
@@ -614,7 +692,6 @@ void controle() {
     return;
   }
 
-  // ENCODERS INDIVIDUAIS
   atualizaEncoders();
 
   const int32_t pe = pulsosEsq;
@@ -628,12 +705,31 @@ void controle() {
 
   pos_esq += dpe * DIST_PER_PULSE;
   pos_dir += dpd * DIST_PER_PULSE;
+
   pos = (pos_esq + pos_dir) * 0.5f;
 
   pe_prev = pe;
   pd_prev = pd;
 
-  // VELOCIDADES LINEARES INDIVIDUAIS
+  // WATCHDOG BLE AMPLIADO PARA MANTER MOVIMENTO FLUIDO AO SEGURAR
+  if (millis() - t_ultimo_pacote_ms > 400) {
+    modo_movimento = 0;
+    cmd_giro = 0.0f;
+  }
+
+  // ATUALIZAÇÃO DA REFERÊNCIA X_REF (SENTIDOS CORRIGIDOS)
+  if (modo_movimento == 1) {        // Seta Cima -> Avançar para Frente
+    x_ref += VEL_RAMPA_MPS * TS;
+  } else if (modo_movimento == 2) { // Seta Baixo -> Recuar (Ré)
+    x_ref -= VEL_RAMPA_MPS * TS;
+  } else if (modo_movimento == 3) { // Zero Absoluto (Botão X)
+    x_ref = 0.0f;
+  } else {                          // Mantém a Posição Atual
+    if (cmd_giro != 0.0f) {
+      x_ref = pos;                  // Atualiza a referência de posição no meio do giro
+    }
+  }
+
   const uint32_t idx = k % WIN_V;
 
   if (k >= WIN_V) {
@@ -677,28 +773,25 @@ void controle() {
   const float t_s = (uint32_t)(t_c - t0_us) * 1e-6f;
   const float g_ramp = (RAMP_S <= 0.0f) ? 1.0f : fminf(1.0f, t_s / RAMP_S);
 
-  // LQR BASE DE EQUILÍBRIO
-  float esforco = -(K_X * pos + K_THETA * theta + K_V * vel + K_W * omega);
+  const float erro_pos = pos - x_ref;
+
+  // CÁLCULO PRINCIPAL LQR
+  float esforco = -(K_X * erro_pos + K_THETA * theta + K_V * vel + K_W * omega);
   esforco = fmaxf(-12.0f, fminf(12.0f, esforco));
 
   float u = esforco * g_ramp;
   u = fmaxf(-U_LIMIT_V, fminf(U_LIMIT_V, u));
 
-  // MALHA DIFERENCIAL DE YAW (CORRIGIDA)
-  // delta_pos positivo significa que a roda esquerda andou MAIS que a direita.
-  // Para corrigir, tiramos tensão da esquerda e somamos na direita.
-  const float delta_pos = pos_esq - pos_dir;
-  const float delta_vel = vel_esq - vel_dir;
+  // APLICAÇÃO SUAVE DE GIRO YAW
+  const float u_esq = -u - cmd_giro;
+  const float u_dir =  u - cmd_giro;
 
-  const float u_yaw = (K_P_YAW * delta_pos) + (K_D_YAW * delta_vel);
-
-  // PARADAS DE SEGURANCA
   ciclos_sat = (fabsf(u) >= U_LIMIT_V - 0.01f) ? ciclos_sat + 1 : 0;
   ciclos_vel_alta = (fabsf(vel) >= VEL_MAX_MPS - 0.01f) ? ciclos_vel_alta + 1 : 0;
 
   const char* falha = nullptr;
 
-  if (fabsf(pos) > POS_MAX_M) falha = "curso_excedido";
+  if (fabsf(erro_pos) > POS_MAX_M) falha = "curso_excedido";
   else if (ciclos_sat > SAT_MAX_CICLOS) falha = "saturacao_prolongada";
   else if (ciclos_vel_alta > VEL_ALTA_MAX_CICLOS) falha = "velocidade_alta";
 
@@ -707,18 +800,12 @@ void controle() {
     return;
   }
 
-  // ACIONAMENTO COM SINAL INVERTIDO/CORRETO
-  // Se ao rodar ele começar a girar em torno do próprio eixo feito pião, 
-  // inverta o sinal de u_yaw abaixo (-u + u_yaw e u + u_yaw)
-  motorEsq.setVoltage(-u + u_yaw);
-  motorDir.setVoltage(u + u_yaw);
+  motorEsq.setVoltage(u_esq);
+  motorDir.setVoltage(u_dir);
 
   k++;
 }
 
-// ============================================================
-// SERIAL
-// ============================================================
 void trataSerial() {
   while (Serial.available() > 0) {
     const char c = Serial.read();
@@ -735,9 +822,6 @@ void trataSerial() {
   }
 }
 
-// ============================================================
-// INICIALIZACAO
-// ============================================================
 bool inicializaRobo() {
   if (!iniciaI2cEMpu()) {
     Serial.println("[ERRO] Dispositivo nao respondeu em 0x68.");
@@ -818,13 +902,9 @@ bool inicializaRobo() {
   return true;
 }
 
-// ============================================================
-// SETUP / LOOP
-// ============================================================
 void setup() {
   pinMode(PIN_LED, OUTPUT);
   pinMode(PIN_BOOT, INPUT_PULLUP);
-
   pinMode(3, INPUT_PULLUP);
 
   motorEsq.begin();
@@ -833,9 +913,29 @@ void setup() {
   Serial.begin(115200);
   delay(500);
 
+  BLEDevice::init("Robo_Pendulo_ESP32");
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  pTxCharacteristic = pService->createCharacteristic(
+                       CHARACTERISTIC_UUID_TX,
+                       BLECharacteristic::PROPERTY_NOTIFY
+                     );
+  pTxCharacteristic->addDescriptor(new BLE2902());
+
+  BLECharacteristic *pRxCharacteristic = pService->createCharacteristic(
+                                           CHARACTERISTIC_UUID_RX,
+                                           BLECharacteristic::PROPERTY_WRITE
+                                         );
+  pRxCharacteristic->setCallbacks(new MyCallbacks());
+
+  pService->start();
+  pServer->getAdvertising()->start();
+
   Serial.println();
-  Serial.printf("=== PENDULO INVERTIDO ESP32 | Motores: %s ===\n",
-                MOTORS_ENABLED ? "HABILITADOS" : "DESABILITADOS");
+  Serial.printf("=== PENDULO INVERTIDO ESP32 | Sentido e Mobilidade Rápida OK ===\n");
 
   if (digitalRead(PIN_BOOT) == LOW) {
     Serial.println("[CANCELADO] Botao BOOT pressionado.");
