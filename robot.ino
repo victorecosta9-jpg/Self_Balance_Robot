@@ -14,7 +14,7 @@
 #include <BLE2902.h>
 
 // ============================================================
-// FW2 RESILIENTE - Teste de Resposta + Anotações MQTT para Kaique
+// FW2 RESILIENTE - Velocidade Dinâmica + Curvas em Arco (Raio Ajustável)
 // ============================================================
 
 #define MOTORS_ENABLED 1
@@ -51,9 +51,11 @@ const float K_THETA = -22.0804f;
 const float K_V = -14.3991f;
 const float K_W = -1.8563f;
 
-// YAW E MOBILIDADE
-const float VEL_RAMPA_MPS = 1.20f; // Avanço rápido (1.2 m/s)
-const float PASSO_GIRO = 2.0f;     // Tensão de giro suave [Volts]
+// CONFIGURAÇÃO DE VELOCIDADE DINÂMICA E CURVAS
+const float VEL_MAX_RAMPA = 1.80f;     // Velocidade máxima de cruzeiro (m/s)
+const float ACEL_RAMPA = 2.50f;         // Aceleração da rampa (m/s²)
+const float THETA_COMPENSACAO_DEG = 2.5f; // Inclinação intencional (feedforward) para aceleração rápida
+const float PASSO_GIRO_BASE = 2.2f;     // Tensão de giro base [Volts]
 
 const float U_LIMIT_V = 11.1f;
 const float RAMP_S = 0.03f;
@@ -88,10 +90,10 @@ const uint8_t GLITCH_REJ_MAX = 2;
 const float OMEGA_MAX_RADS = 10.0f;
 const float OMEGA_SALTO_RADS = 6.0f;
 const float GLITCH_THETA_DEG = 8.0f;
-const float VEL_MAX_MPS = 1.8f;
-const float VEL_GLITCH_MPS = 0.6f;
+const float VEL_MAX_MPS = 2.2f;
+const float VEL_GLITCH_MPS = 0.8f;
 const int32_t ENC_MAX_DELTA = 120;
-const float POS_MAX_M = 5.0f; 
+const float POS_MAX_M = 10.0f; 
 const uint32_t SAT_MAX_CICLOS = 30;
 const uint32_t VEL_ALTA_MAX_CICLOS = 50;
 const float START_WINDOW_DEG = 5.0f;
@@ -109,16 +111,17 @@ enum Estado { SM_INICIALIZANDO, SM_ESPERA_VERTICAL, SM_AUTOMATICO, SM_PARADO };
 Estado estado = SM_INICIALIZANDO;
 
 volatile float x_ref = 0.0f;
+volatile float vel_alvo = 0.0f;          // Velocidade dinâmica atual
 volatile float cmd_giro = 0.0f;
-volatile int modo_movimento = 0; // 0: Manter Posição, 1: Frente, 2: Ré, 3: Zero Absoluto
+volatile int modo_movimento = 0;         // 0: Manter Posição, 1: Frente, 2: Ré, 3: Zero Absoluto
 volatile uint32_t t_ultimo_pacote_ms = 0;
 
-// CONTROLE DO TESTE DE QUEDA DA CONDIÇÃO INICIAL (BOTAO QUADRADO)
+// CONTROLE DO TESTE DE QUEDA
 volatile bool aguardando_queda_20deg = false;
 uint32_t t_inicio_teste_ms = 0;
 
 // ============================================================
-// CALLBACKS BLE - BOTAO QUADRADO DISPARA O TESTE DE QUEDA
+// CALLBACKS BLE - PARSER DE COMANDOS COMBINADOS (CURVAS EM ARCO)
 // ============================================================
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
@@ -144,46 +147,46 @@ class MyCallbacks: public BLECharacteristicCallbacks {
 
       if (len >= 7 && data[0] == 0xFF) {
         uint8_t btn_forma = data[5]; // Botões geométricos (Quadrado, X)
-        uint8_t btn_setas = data[6]; // Setas direcionais
+        uint8_t btn_setas = data[6]; // Setas direcionais (Máscara de bits)
 
-        // 1. CHECA BOTAO QUADRADO (0x20 em data[5]) -> INICIA TESTE DE QUEDA
+        // 1. CHECA BOTAO QUADRADO (TESTE DE QUEDA)
         if (btn_forma & 0x20) {
           aguardando_queda_20deg = true;
           Serial.println("\n--- INICIANDO TESTE: DEIXANDO CAIR ATE O ANGULO DEFINIDO ---");
         }
-        // 2. CHECA BOTAO X (0x10 em data[5]) -> ZERO ABSOLUTO
+        // 2. CHECA BOTAO X (ZERO ABSOLUTO)
         else if (btn_forma & 0x10) {
           modo_movimento = 3;
           cmd_giro = 0.0f;
         } 
-        // 3. CHECA SETAS DIRECIONAIS (data[6])
-        else if (btn_setas & 0x01) {       // Seta Cima -> Avançar
-          modo_movimento = 1;
-          cmd_giro = 0.0f;
-        } else if (btn_setas & 0x02) { // Seta Baixo -> Recuar
-          modo_movimento = 2;
-          cmd_giro = 0.0f;
-        } else if (btn_setas & 0x04) { // Esquerda -> Giro Suave
-          modo_movimento = 0;
-          cmd_giro = -PASSO_GIRO;
-        } else if (btn_setas & 0x08) { // Direita -> Giro Suave
-          modo_movimento = 0;
-          cmd_giro = PASSO_GIRO;
-        } else {                       // Solto
-          modo_movimento = 0;
-          cmd_giro = 0.0f;
+        // 3. PROCESSA COMBINAÇÕES DE SETAS (AVANÇO + GIRO SIMULTÂNEO)
+        else {
+          // Processamento do sentido longitudinal
+          if (btn_setas & 0x01) {       // Cima
+            modo_movimento = 1;
+          } else if (btn_setas & 0x02) { // Baixo
+            modo_movimento = 2;
+          } else {
+            modo_movimento = 0;
+          }
+
+          // Processamento do sentido de giro
+          if (btn_setas & 0x04) {       // Esquerda
+            cmd_giro = -PASSO_GIRO_BASE;
+          } else if (btn_setas & 0x08) { // Direita
+            cmd_giro = PASSO_GIRO_BASE;
+          } else {
+            cmd_giro = 0.0f;
+          }
         }
       } 
       else if (len == 1) {
         char c = rxValue[0];
-        if (c == 'S' || c == 'q') { 
-          aguardando_queda_20deg = true; 
-          Serial.println("\n--- INICIANDO TESTE: DEIXANDO CAIR ATE O ANGULO DEFINIDO ---");
-        }
+        if (c == 'S' || c == 'q') { aguardando_queda_20deg = true; }
         else if (c == 'F') { modo_movimento = 1; cmd_giro = 0.0f; }
         else if (c == 'B') { modo_movimento = 2; cmd_giro = 0.0f; }
-        else if (c == 'L') { modo_movimento = 0; cmd_giro = -PASSO_GIRO; }
-        else if (c == 'R') { modo_movimento = 0; cmd_giro = PASSO_GIRO; }
+        else if (c == 'L') { modo_movimento = 0; cmd_giro = -PASSO_GIRO_BASE; }
+        else if (c == 'R') { modo_movimento = 0; cmd_giro = PASSO_GIRO_BASE; }
         else if (c == 'X') { modo_movimento = 3; cmd_giro = 0.0f; }
         else { modo_movimento = 0; cmd_giro = 0.0f; }
       }
@@ -538,6 +541,7 @@ void iniciaControle() {
   pos_esq = 0.0f;
   pos_dir = 0.0f;
   x_ref = 0.0f; 
+  vel_alvo = 0.0f;
   
   vel = 0.0f;
   vel_esq = 0.0f;
@@ -705,14 +709,15 @@ void controle() {
 
     Serial.printf("MODO_TESTE,%.2f\n", theta_deg);
 
-    if (fabsf(theta_deg) >= 20.0f) { // <-- Altere o valor limite de disparo do teste aqui se quiser
+    if (fabsf(theta_deg) >= 20.0f) {
       aguardando_queda_20deg = false;
       t_inicio_teste_ms = millis();
       x_ref = pos; 
+      vel_alvo = 0.0f;
       Serial.println("--- ANGULO LIMITE ATINGIDO! LQR REASSUMINDO ---");
       Serial.println("Tempo_ms,Theta_deg,Omega_deg_s,Posicao_m,Velocidade_m_s,Esforco_V");
     }
-    return; // Pula o LQR enquanto cai
+    return;
   }
 
   atualizaEncoders();
@@ -741,16 +746,40 @@ void controle() {
     cmd_giro = 0.0f;
   }
 
-  // ATUALIZAÇÃO DA REFERÊNCIA X_REF
+  // ============================================================
+  // PERFIL DE VELOCIDADE DINÂMICA ADAPTATIVA (ACELERAÇÃO SUAVE E RÁPIDA)
+  // ============================================================
+  float v_destino = 0.0f;
+  float theta_bias = 0.0f;
+
   if (modo_movimento == 1) {        // Avançar (Frente)
-    x_ref += VEL_RAMPA_MPS * TS;
+    v_destino = VEL_MAX_RAMPA;
+    theta_bias = -(THETA_COMPENSACAO_DEG * PI / 180.0f); // Inclina pra frente para acelerar
   } else if (modo_movimento == 2) { // Recuar (Ré)
-    x_ref -= VEL_RAMPA_MPS * TS;
+    v_destino = -VEL_MAX_RAMPA;
+    theta_bias = (THETA_COMPENSACAO_DEG * PI / 180.0f);  // Inclina pra trás para acelerar
   } else if (modo_movimento == 3) { // Zero Absoluto (Botão X)
+    v_destino = 0.0f;
     x_ref = 0.0f;
-  } else {                          // Mantém Posição
-    if (cmd_giro != 0.0f) {
-      x_ref = pos;                  
+  } else {                          // Parado / Girando
+    v_destino = 0.0f;
+  }
+
+  // Rampa de aceleração/desaceleração da velocidade
+  if (vel_alvo < v_destino) {
+    vel_alvo += ACEL_RAMPA * TS;
+    if (vel_alvo > v_destino) vel_alvo = v_destino;
+  } else if (vel_alvo > v_destino) {
+    vel_alvo -= ACEL_RAMPA * TS;
+    if (vel_alvo < v_destino) vel_alvo = v_destino;
+  }
+
+  // Atualização da posição de referência
+  if (modo_movimento != 3) {
+    if (modo_movimento == 0 && cmd_giro != 0.0f) {
+      x_ref = pos; // Trava a posição no eixo ao girar parado
+    } else {
+      x_ref += vel_alvo * TS;
     }
   }
 
@@ -804,28 +833,37 @@ void controle() {
 
   const float erro_pos = pos - x_ref;
 
-  // CÁLCULO PRINCIPAL LQR
-  float esforco = -(K_X * erro_pos + K_THETA * theta + K_V * vel + K_W * omega);
+  // CÁLCULO DO LQR COM FEEDFORWARD DE INCLINAÇÃO (theta - theta_bias)
+  float esforco = -(K_X * erro_pos + K_THETA * (theta - theta_bias) + K_V * vel + K_W * omega);
   esforco = fmaxf(-12.0f, fminf(12.0f, esforco));
 
   // KAIQUE, RETIRE ESSA INFORMAÇÃO PARA O MQTT: ESFORÇO DE CONTROLE EM VOLTS (u)
   float u = esforco * g_ramp;
   u = fmaxf(-U_LIMIT_V, fminf(U_LIMIT_V, u));
 
-  // KAIQUE, RETIRE ESSA INFORMAÇÃO PARA O MQTT: IMPRESSÃO DOS DADOS COMPLETOS PARA A DASHBOARD / MATLAB
+  // KAIQUE, RETIRE ESSA INFORMAÇÃO PARA O MQTT: IMPRESSÃO DOS DADOS PARA O DASHBOARD / MATLAB
   if (t_inicio_teste_ms > 0) {
     uint32_t t_rel = millis() - t_inicio_teste_ms;
     Serial.printf("%lu,%.4f,%.4f,%.4f,%.4f,%.4f\n", t_rel, theta_deg, omega_deg_s, pos, vel, u);
 
-    if (t_rel > 3000) { // Registra por 3 segundos de teste
+    if (t_rel > 3000) {
       t_inicio_teste_ms = 0;
       Serial.println("--- TESTE CONCLUIDO ---");
     }
   }
 
-  // APLICAÇÃO DE GIRO SUAVE
-  const float u_esq = -u - cmd_giro;
-  const float u_dir =  u - cmd_giro;
+  // ============================================================
+  // AJUSTE DINÂMICO DE GIRO EM ARCO (AJUSTE AUTOMÁTICO DE RAIO)
+  // ============================================================
+  float u_yaw = cmd_giro;
+  
+  // Se o robô estiver em movimento, suaviza o giro para fazer curva aberta e estável
+  if (fabsf(vel_alvo) > 0.1f) {
+    u_yaw *= 0.65f; 
+  }
+
+  const float u_esq = -u - u_yaw;
+  const float u_dir =  u - u_yaw;
 
   ciclos_sat = (fabsf(u) >= U_LIMIT_V - 0.01f) ? ciclos_sat + 1 : 0;
   ciclos_vel_alta = (fabsf(vel) >= VEL_MAX_MPS - 0.01f) ? ciclos_vel_alta + 1 : 0;
@@ -976,7 +1014,7 @@ void setup() {
   pServer->getAdvertising()->start();
 
   Serial.println();
-  Serial.printf("=== PENDULO INVERTIDO ESP32 | Comentarios MQTT Configurados ===\n");
+  Serial.printf("=== PENDULO INVERTIDO ESP32 | Velocidade Dinamica + Curvas em Arco ===\n");
 
   if (digitalRead(PIN_BOOT) == LOW) {
     Serial.println("[CANCELADO] Botao BOOT pressionado.");
