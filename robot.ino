@@ -14,7 +14,7 @@
 #include <BLE2902.h>
 
 // ============================================================
-// FW2 RESILIENTE - Velocidade Dinâmica + Curvas em Arco (Raio Ajustável)
+// FW2 RESILIENTE - LQR Puro + Movimentação Perfeita Liberada
 // ============================================================
 
 #define MOTORS_ENABLED 1
@@ -45,17 +45,16 @@ bool deviceConnected = false;
 #define PIN_ENC_DIR_A 35
 #define PIN_ENC_DIR_B 34
 
-// CONTROLE: GANHOS LQR
+// CONTROLE: GANHOS LQR (OFICIAIS)
 const float K_X = -6.9220f;
 const float K_THETA = -22.0804f;
 const float K_V = -14.3991f;
 const float K_W = -1.8563f;
 
-// CONFIGURAÇÃO DE VELOCIDADE DINÂMICA E CURVAS
-const float VEL_MAX_RAMPA = 1.80f;     // Velocidade máxima de cruzeiro (m/s)
-const float ACEL_RAMPA = 2.50f;         // Aceleração da rampa (m/s²)
-const float THETA_COMPENSACAO_DEG = 2.5f; // Inclinação intencional (feedforward) para aceleração rápida
-const float PASSO_GIRO_BASE = 2.2f;     // Tensão de giro base [Volts]
+// YAW E MOBILIDADE
+const float VEL_RAMPA_MPS = 2.00f;        
+const float PASSO_GIRO = 3.2f;            
+const float THETA_FEEDFORWARD_DEG = 4.2f; 
 
 const float U_LIMIT_V = 11.1f;
 const float RAMP_S = 0.03f;
@@ -90,12 +89,14 @@ const uint8_t GLITCH_REJ_MAX = 2;
 const float OMEGA_MAX_RADS = 10.0f;
 const float OMEGA_SALTO_RADS = 6.0f;
 const float GLITCH_THETA_DEG = 8.0f;
-const float VEL_MAX_MPS = 2.2f;
+const float VEL_MAX_MPS = 3.5f;
 const float VEL_GLITCH_MPS = 0.8f;
 const int32_t ENC_MAX_DELTA = 120;
-const float POS_MAX_M = 10.0f; 
-const uint32_t SAT_MAX_CICLOS = 30;
-const uint32_t VEL_ALTA_MAX_CICLOS = 50;
+
+const float POS_MAX_M = 100.0f; 
+
+const uint32_t SAT_MAX_CICLOS = 100;
+const uint32_t VEL_ALTA_MAX_CICLOS = 100;
 const float START_WINDOW_DEG = 5.0f;
 const int START_OK_SAMPLES = 20;
 const uint32_t START_TIMEOUT_MS = 5000;
@@ -111,23 +112,19 @@ enum Estado { SM_INICIALIZANDO, SM_ESPERA_VERTICAL, SM_AUTOMATICO, SM_PARADO };
 Estado estado = SM_INICIALIZANDO;
 
 volatile float x_ref = 0.0f;
-volatile float vel_alvo = 0.0f;          // Velocidade dinâmica atual
 volatile float cmd_giro = 0.0f;
-volatile int modo_movimento = 0;         // 0: Manter Posição, 1: Frente, 2: Ré, 3: Zero Absoluto
+volatile int modo_movimento = 0; // 0: Parado, 1: Frente, 2: Ré
 volatile uint32_t t_ultimo_pacote_ms = 0;
 
-// CONTROLE DO TESTE DE QUEDA
+// CONTROLE DO TESTE DE QUEDA DE 20°
 volatile bool aguardando_queda_20deg = false;
 uint32_t t_inicio_teste_ms = 0;
 
 // ============================================================
-// CALLBACKS BLE - PARSER DE COMANDOS COMBINADOS (CURVAS EM ARCO)
+// CALLBACKS BLE (GAMEPAD DABBLE - MOVIMENTO PURAMENTE LQR)
 // ============================================================
 class MyServerCallbacks: public BLEServerCallbacks {
-    void onConnect(BLEServer* pServer) {
-      deviceConnected = true;
-    };
-
+    void onConnect(BLEServer* pServer) { deviceConnected = true; };
     void onDisconnect(BLEServer* pServer) {
       deviceConnected = false;
       modo_movimento = 0;
@@ -145,39 +142,31 @@ class MyCallbacks: public BLECharacteristicCallbacks {
       uint8_t len = rxValue.length();
       uint8_t* data = (uint8_t*)rxValue.c_str();
 
-      if (len >= 7 && data[0] == 0xFF) {
-        uint8_t btn_forma = data[5]; // Botões geométricos (Quadrado, X)
-        uint8_t btn_setas = data[6]; // Setas direcionais (Máscara de bits)
+      if (len >= 6 && data[0] == 0xFF) {
+        uint8_t btn_forma = data[5];
+        uint8_t btn_setas = (len >= 7) ? data[6] : 0;
 
-        // 1. CHECA BOTAO QUADRADO (TESTE DE QUEDA)
+        // BOTAO QUADRADO (0x20) -> TESTE DE QUEDA DE 20°
         if (btn_forma & 0x20) {
           aguardando_queda_20deg = true;
-          Serial.println("\n--- INICIANDO TESTE: DEIXANDO CAIR ATE O ANGULO DEFINIDO ---");
+          Serial.println("\n--- INICIANDO TESTE DE QUEDA DE 20 GRAUS ---");
         }
-        // 2. CHECA BOTAO X (ZERO ABSOLUTO)
-        else if (btn_forma & 0x10) {
-          modo_movimento = 3;
+        // SETAS DIRECIONAIS DE MOVIMENTO
+        else if (btn_setas & 0x01) {       // Cima -> Frente
+          modo_movimento = 1;
           cmd_giro = 0.0f;
-        } 
-        // 3. PROCESSA COMBINAÇÕES DE SETAS (AVANÇO + GIRO SIMULTÂNEO)
-        else {
-          // Processamento do sentido longitudinal
-          if (btn_setas & 0x01) {       // Cima
-            modo_movimento = 1;
-          } else if (btn_setas & 0x02) { // Baixo
-            modo_movimento = 2;
-          } else {
-            modo_movimento = 0;
-          }
-
-          // Processamento do sentido de giro
-          if (btn_setas & 0x04) {       // Esquerda
-            cmd_giro = -PASSO_GIRO_BASE;
-          } else if (btn_setas & 0x08) { // Direita
-            cmd_giro = PASSO_GIRO_BASE;
-          } else {
-            cmd_giro = 0.0f;
-          }
+        } else if (btn_setas & 0x02) { // Baixo -> Ré
+          modo_movimento = 2;
+          cmd_giro = 0.0f;
+        } else if (btn_setas & 0x04) { // Esquerda
+          modo_movimento = 0;
+          cmd_giro = -PASSO_GIRO;
+        } else if (btn_setas & 0x08) { // Direita
+          modo_movimento = 0;
+          cmd_giro = PASSO_GIRO;
+        } else {                       // Solto
+          modo_movimento = 0;
+          cmd_giro = 0.0f;
         }
       } 
       else if (len == 1) {
@@ -185,9 +174,8 @@ class MyCallbacks: public BLECharacteristicCallbacks {
         if (c == 'S' || c == 'q') { aguardando_queda_20deg = true; }
         else if (c == 'F') { modo_movimento = 1; cmd_giro = 0.0f; }
         else if (c == 'B') { modo_movimento = 2; cmd_giro = 0.0f; }
-        else if (c == 'L') { modo_movimento = 0; cmd_giro = -PASSO_GIRO_BASE; }
-        else if (c == 'R') { modo_movimento = 0; cmd_giro = PASSO_GIRO_BASE; }
-        else if (c == 'X') { modo_movimento = 3; cmd_giro = 0.0f; }
+        else if (c == 'L') { modo_movimento = 0; cmd_giro = -PASSO_GIRO; }
+        else if (c == 'R') { modo_movimento = 0; cmd_giro = PASSO_GIRO; }
         else { modo_movimento = 0; cmd_giro = 0.0f; }
       }
     }
@@ -290,7 +278,6 @@ volatile int32_t pulsosDir = 0;
 
 static void pcntInit(pcnt_unit_t unit, int pinA, int pinB) {
   pcnt_config_t c = {};
-
   c.pulse_gpio_num = pinA;
   c.ctrl_gpio_num = pinB;
   c.channel = PCNT_CHANNEL_0;
@@ -323,7 +310,6 @@ static int16_t pcntUltDir = 0;
 
 void atualizaEncoders() {
   int16_t ce = 0, cd = 0;
-
   pcnt_get_counter_value(PCNT_UNIT_0, &ce);
   pcnt_get_counter_value(PCNT_UNIT_1, &cd);
 
@@ -333,15 +319,14 @@ void atualizaEncoders() {
   pcntUltEsq = ce;
   pcntUltDir = cd;
 
-  pulsosEsq = pulsosEsq + de;
-  pulsosDir = pulsosDir - dd;
+  pulsosEsq += de;
+  pulsosDir -= dd;
 }
 
 // ============================================================
 // MPU6050 / DMP
 // ============================================================
 MPU6050 mpu;
-
 uint8_t devStatus = 255;
 uint16_t packetSize = 0;
 uint8_t fifoBuffer[64];
@@ -363,7 +348,6 @@ static inline float wrap180(float a) {
 
 bool lerFIFO() {
   if (packetSize == 0) return false;
-
   uint16_t n = mpu.getFIFOCount();
 
   if (n >= 1024 || n < packetSize) {
@@ -381,9 +365,7 @@ bool lerFIFO() {
     n -= packetSize;
   }
 
-  const int8_t lidos = I2Cdev::readBytes(MPU6050_ADDRESS_AD0_LOW,
-                                         MPU6050_RA_FIFO_R_W,
-                                         (uint8_t)packetSize, fifoBuffer);
+  const int8_t lidos = I2Cdev::readBytes(MPU6050_ADDRESS_AD0_LOW, MPU6050_RA_FIFO_R_W, (uint8_t)packetSize, fifoBuffer);
 
   if (lidos != (int8_t)packetSize) {
     mpu.resetFIFO();
@@ -393,7 +375,6 @@ bool lerFIFO() {
   mpu.dmpGetQuaternion(&q, fifoBuffer);
 
   const float nq = q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z;
-
   if (nq < 0.95f || nq > 1.05f) {
     mpu.resetFIFO();
     return false;
@@ -405,15 +386,12 @@ bool lerFIFO() {
   dmp_roll_deg = ypr[2] * 180.0f / PI;
   dmp_ultimo_us = micros();
   dmp_pacotes++;
-
   return true;
 }
 
 bool atualizaIMU(bool forcar) {
   const uint32_t agora = micros();
-
   if (!forcar && (uint32_t)(agora - t_poll_us) < 1000) return false;
-
   t_poll_us = agora;
   return lerFIFO();
 }
@@ -421,7 +399,6 @@ bool atualizaIMU(bool forcar) {
 void i2cBusRecover() {
   pinMode(PIN_I2C_SCL, OUTPUT_OPEN_DRAIN);
   pinMode(PIN_I2C_SDA, OUTPUT_OPEN_DRAIN);
-
   digitalWrite(PIN_I2C_SCL, HIGH);
   digitalWrite(PIN_I2C_SDA, HIGH);
   delayMicroseconds(20);
@@ -457,8 +434,6 @@ bool iniciaI2cEMpu() {
     const uint8_t erro = Wire.endTransmission();
 
     if (erro == 0) return true;
-
-    Serial.printf("[I2C] Sem ACK; codigo %u\n", erro);
 
     Wire.end();
     delay(100);
@@ -541,7 +516,6 @@ void iniciaControle() {
   pos_esq = 0.0f;
   pos_dir = 0.0f;
   x_ref = 0.0f; 
-  vel_alvo = 0.0f;
   
   vel = 0.0f;
   vel_esq = 0.0f;
@@ -586,7 +560,7 @@ void iniciaControle() {
 }
 
 // ============================================================
-// ROTINA DE CONTROLE (100 Hz)
+// ROTINA DE CONTROLE (100 Hz - PURAMENTE LQR)
 // ============================================================
 void controle() {
   const uint32_t t_entrada = micros();
@@ -697,12 +671,9 @@ void controle() {
   theta_valido = theta_novo;
   theta_valido_ok = true;
 
-  // KAIQUE, RETIRE ESSA INFORMAÇÃO PARA O MQTT: ÂNGULO EM GRAUS (theta_deg)
   const float theta_deg = theta * (180.0f / PI);
 
-  // ============================================================
-  // LOGICA DO TESTE DE QUEDA LIVRE (|theta_deg| >= 20.0f)
-  // ============================================================
+  // DATALOGGER / TESTE DE QUEDA DE 20°
   if (aguardando_queda_20deg) {
     motorEsq.stop();
     motorDir.stop();
@@ -713,8 +684,7 @@ void controle() {
       aguardando_queda_20deg = false;
       t_inicio_teste_ms = millis();
       x_ref = pos; 
-      vel_alvo = 0.0f;
-      Serial.println("--- ANGULO LIMITE ATINGIDO! LQR REASSUMINDO ---");
+      Serial.println("--- ANGULO LIMITE ATINGIDO! REASSUMINDO CONTROLE ---");
       Serial.println("Tempo_ms,Theta_deg,Omega_deg_s,Posicao_m,Velocidade_m_s,Esforco_V");
     }
     return;
@@ -734,53 +704,30 @@ void controle() {
   pos_esq += dpe * DIST_PER_PULSE;
   pos_dir += dpd * DIST_PER_PULSE;
 
-  // KAIQUE, RETIRE ESSA INFORMAÇÃO PARA O MQTT: POSIÇÃO LINEAR EM METROS (pos)
   pos = (pos_esq + pos_dir) * 0.5f;
 
   pe_prev = pe;
   pd_prev = pd;
 
   // WATCHDOG BLE
-  if (millis() - t_ultimo_pacote_ms > 400) {
+  if (millis() - t_ultimo_pacote_ms > 1200) {
     modo_movimento = 0;
     cmd_giro = 0.0f;
   }
 
-  // ============================================================
-  // PERFIL DE VELOCIDADE DINÂMICA ADAPTATIVA (ACELERAÇÃO SUAVE E RÁPIDA)
-  // ============================================================
-  float v_destino = 0.0f;
+  // MOVIMENTAÇÃO CONTÍNUA CORRIGIDA (80 cm MARGEM)
   float theta_bias = 0.0f;
 
-  if (modo_movimento == 1) {        // Avançar (Frente)
-    v_destino = VEL_MAX_RAMPA;
-    theta_bias = -(THETA_COMPENSACAO_DEG * PI / 180.0f); // Inclina pra frente para acelerar
-  } else if (modo_movimento == 2) { // Recuar (Ré)
-    v_destino = -VEL_MAX_RAMPA;
-    theta_bias = (THETA_COMPENSACAO_DEG * PI / 180.0f);  // Inclina pra trás para acelerar
-  } else if (modo_movimento == 3) { // Zero Absoluto (Botão X)
-    v_destino = 0.0f;
-    x_ref = 0.0f;
-  } else {                          // Parado / Girando
-    v_destino = 0.0f;
-  }
-
-  // Rampa de aceleração/desaceleração da velocidade
-  if (vel_alvo < v_destino) {
-    vel_alvo += ACEL_RAMPA * TS;
-    if (vel_alvo > v_destino) vel_alvo = v_destino;
-  } else if (vel_alvo > v_destino) {
-    vel_alvo -= ACEL_RAMPA * TS;
-    if (vel_alvo < v_destino) vel_alvo = v_destino;
-  }
-
-  // Atualização da posição de referência
-  if (modo_movimento != 3) {
-    if (modo_movimento == 0 && cmd_giro != 0.0f) {
-      x_ref = pos; // Trava a posição no eixo ao girar parado
-    } else {
-      x_ref += vel_alvo * TS;
-    }
+  if (modo_movimento == 1) {        // Avançar (Seta Cima)
+    x_ref += VEL_RAMPA_MPS * TS;
+    theta_bias = -(THETA_FEEDFORWARD_DEG * PI / 180.0f);
+    if (x_ref - pos > 0.80f) x_ref = pos + 0.80f;
+  } else if (modo_movimento == 2) { // Recuar (Seta Baixo)
+    x_ref -= VEL_RAMPA_MPS * TS;
+    theta_bias = (THETA_FEEDFORWARD_DEG * PI / 180.0f);
+    if (pos - x_ref > 0.80f) x_ref = pos - 0.80f;
+  } else if (cmd_giro != 0.0f) {
+    x_ref = pos;                  
   }
 
   const uint32_t idx = k % WIN_V;
@@ -798,7 +745,6 @@ void controle() {
       vel_esq = fmaxf(-VEL_MAX_MPS, fminf(VEL_MAX_MPS, ve_nova));
       vel_dir = fmaxf(-VEL_MAX_MPS, fminf(VEL_MAX_MPS, vd_nova));
 
-      // KAIQUE, RETIRE ESSA INFORMAÇÃO PARA O MQTT: VELOCIDADE LINEAR EM M/S (vel)
       vel = (vel_esq + vel_dir) * 0.5f;
     }
   }
@@ -825,7 +771,6 @@ void controle() {
 
   omega_prev_ctrl = omega;
 
-  // KAIQUE, RETIRE ESSA INFORMAÇÃO PARA O MQTT: VELOCIDADE ANGULAR EM GRAUS/S (omega_deg_s)
   const float omega_deg_s = omega * (180.0f / PI);
 
   const float t_s = (uint32_t)(t_c - t0_us) * 1e-6f;
@@ -833,15 +778,14 @@ void controle() {
 
   const float erro_pos = pos - x_ref;
 
-  // CÁLCULO DO LQR COM FEEDFORWARD DE INCLINAÇÃO (theta - theta_bias)
+  // MALHA LQR PURA
   float esforco = -(K_X * erro_pos + K_THETA * (theta - theta_bias) + K_V * vel + K_W * omega);
   esforco = fmaxf(-12.0f, fminf(12.0f, esforco));
 
-  // KAIQUE, RETIRE ESSA INFORMAÇÃO PARA O MQTT: ESFORÇO DE CONTROLE EM VOLTS (u)
   float u = esforco * g_ramp;
   u = fmaxf(-U_LIMIT_V, fminf(U_LIMIT_V, u));
 
-  // KAIQUE, RETIRE ESSA INFORMAÇÃO PARA O MQTT: IMPRESSÃO DOS DADOS PARA O DASHBOARD / MATLAB
+  // IMPRESSÃO DATALOGGER
   if (t_inicio_teste_ms > 0) {
     uint32_t t_rel = millis() - t_inicio_teste_ms;
     Serial.printf("%lu,%.4f,%.4f,%.4f,%.4f,%.4f\n", t_rel, theta_deg, omega_deg_s, pos, vel, u);
@@ -852,26 +796,16 @@ void controle() {
     }
   }
 
-  // ============================================================
-  // AJUSTE DINÂMICO DE GIRO EM ARCO (AJUSTE AUTOMÁTICO DE RAIO)
-  // ============================================================
-  float u_yaw = cmd_giro;
-  
-  // Se o robô estiver em movimento, suaviza o giro para fazer curva aberta e estável
-  if (fabsf(vel_alvo) > 0.1f) {
-    u_yaw *= 0.65f; 
-  }
-
-  const float u_esq = -u - u_yaw;
-  const float u_dir =  u - u_yaw;
+  // APLICAÇÃO DE GIRO
+  const float u_esq = -u - cmd_giro;
+  const float u_dir =  u - cmd_giro;
 
   ciclos_sat = (fabsf(u) >= U_LIMIT_V - 0.01f) ? ciclos_sat + 1 : 0;
   ciclos_vel_alta = (fabsf(vel) >= VEL_MAX_MPS - 0.01f) ? ciclos_vel_alta + 1 : 0;
 
   const char* falha = nullptr;
 
-  if (fabsf(erro_pos) > POS_MAX_M) falha = "curso_excedido";
-  else if (ciclos_sat > SAT_MAX_CICLOS) falha = "saturacao_prolongada";
+  if (ciclos_sat > SAT_MAX_CICLOS) falha = "saturacao_prolongada";
   else if (ciclos_vel_alta > VEL_ALTA_MAX_CICLOS) falha = "velocidade_alta";
 
   if (falha) {
@@ -983,6 +917,8 @@ bool inicializaRobo() {
 
 void setup() {
   pinMode(PIN_LED, OUTPUT);
+  digitalWrite(PIN_LED, HIGH);
+
   pinMode(PIN_BOOT, INPUT_PULLUP);
   pinMode(3, INPUT_PULLUP);
 
@@ -1014,7 +950,7 @@ void setup() {
   pServer->getAdvertising()->start();
 
   Serial.println();
-  Serial.printf("=== PENDULO INVERTIDO ESP32 | Velocidade Dinamica + Curvas em Arco ===\n");
+  Serial.printf("=== ROBÔ PÊNDULO ESP32 | LQR Puro + Movimentação OK ===\n");
 
   if (digitalRead(PIN_BOOT) == LOW) {
     Serial.println("[CANCELADO] Botao BOOT pressionado.");
