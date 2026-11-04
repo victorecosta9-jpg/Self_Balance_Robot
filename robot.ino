@@ -87,10 +87,13 @@ const float K_THETA = -22.0804f;
 const float K_V = -14.3991f;
 const float K_W = -1.8563f;
 
-// CONTROLE: GANHOS PID (Kp = 4.0 SOLICITADO)
-const float KP_PID = 4.0000f;
+// CONTROLE: GANHOS PID (SOLICITADO)
+const float KP_PID = 12.0000f;
 const float KI_PID = 0.0000f;
-const float KD_PID = 0.2500f;
+const float KD_PID = 0.8500f;
+
+// CONTROLE: COMPENSAÇÃO DE ALINHAMENTO/SINCRONISMO DAS RODAS
+const float K_DIFF = 2.5000f;
 
 // YAW E MOBILIDADE
 const float VEL_RAMPA_MPS = 2.00f;        
@@ -164,6 +167,9 @@ uint32_t t_inicio_teste_ms = 0;
 volatile bool modo_pid = false;            // false = LQR | true = PID
 volatile bool btn_triangulo_prev = false;   
 float erro_int = 0.0f;                     
+
+float pos = 0.0f;
+float pos_esq = 0.0f, pos_dir = 0.0f;
 
 // ============================================================
 // TASK MQTT (Roda no Core 0)
@@ -252,25 +258,25 @@ class MyServerCallbacks: public BLEServerCallbacks {
 
 class MyCallbacks: public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic *pCharacteristic) {
-      String rxValue = pCharacteristic->getValue();
+      uint8_t* data = pCharacteristic->getData();
+      size_t len = pCharacteristic->getLength();
       t_ultimo_pacote_ms = millis();
-
-      uint8_t len = rxValue.length();
-      uint8_t* data = (uint8_t*)rxValue.c_str();
 
       if (len >= 6 && data[0] == 0xFF) {
         uint8_t btn_forma = data[5];
         uint8_t btn_setas = (len >= 7) ? data[6] : 0;
 
-        // BOTAO TRIÂNGULO (IDENTIFICADO COM MÁSCARA 0x04)
+        // BOTAO TRIÂNGULO (0x04)
         bool btn_triangulo_atual = (btn_forma & 0x04);
         if (btn_triangulo_atual && !btn_triangulo_prev) {
           modo_pid = !modo_pid;
-          erro_int = 0.0f; // Reseta o integrador do PID ao trocar de malha
+          erro_int = 0.0f; // Reseta integrador
+          x_ref = pos;     // Iguala a referência para evitar tranco
+
           if (modo_pid) {
             Serial.println("\n>>> MODO ALTERNADO PARA: PID (Kp = 4.0) <<<");
           } else {
-            Serial.println("\n>>> MODO ALTERNADO PARA: LQR PURO <<<");
+            Serial.println("\n>>> MODO ALTERNADO PARA: LQR PURO (POSIÇÃO RESETADA) <<<");
           }
         }
         btn_triangulo_prev = btn_triangulo_atual;
@@ -299,10 +305,11 @@ class MyCallbacks: public BLECharacteristicCallbacks {
         }
       } 
       else if (len == 1) {
-        char c = rxValue[0];
+        char c = (char)data[0];
         if (c == 't' || c == 'T' || c == 'U' || c == 'u') { 
           modo_pid = !modo_pid; 
           erro_int = 0.0f;
+          x_ref = pos;
           if (modo_pid) Serial.println("\n>>> MODO ALTERNADO PARA: PID (Kp = 4.0) <<<");
           else Serial.println("\n>>> MODO ALTERNADO PARA: LQR PURO <<<");
         }
@@ -595,10 +602,8 @@ uint8_t rej_theta = 0;
 
 int32_t pe_prev = 0;
 int32_t pd_prev = 0;
-float pos = 0.0f;
 float vel = 0.0f;
 
-float pos_esq = 0.0f, pos_dir = 0.0f;
 float vel_esq = 0.0f, vel_dir = 0.0f;
 
 float hp_esq[WIN_V], hp_dir[WIN_V];
@@ -918,11 +923,13 @@ void controle() {
   float esforco = 0.0f;
 
   if (modo_pid) {
+    // MALHA PID (POLARIDADE ALINHADA AO LQR)
     float erro_theta = (theta - theta_bias);
     erro_int += erro_theta * TS;
     erro_int = fmaxf(-2.0f, fminf(2.0f, erro_int));
-    esforco = -(KP_PID * erro_theta + KI_PID * erro_int + KD_PID * omega);
+    esforco = +(KP_PID * erro_theta + KI_PID * erro_int + KD_PID * omega);
   } else {
+    // MALHA LQR PURA
     esforco = -(K_X * erro_pos + K_THETA * (theta - theta_bias) + K_V * vel + K_W * omega);
   }
 
@@ -931,7 +938,7 @@ void controle() {
   float u = esforco * g_ramp;
   u = fmaxf(-U_LIMIT_V, fminf(U_LIMIT_V, u));
 
-  // ENVIO MQTT (Não-bloqueante no Core 0)
+  // ENVIO MQTT
   static uint8_t cont_mqtt = 0;
   if (++cont_mqtt >= MQTT_DECIMACAO) {
     cont_mqtt = 0;
@@ -956,9 +963,12 @@ void controle() {
     }
   }
 
-  // APLICAÇÃO DE GIRO
-  const float u_esq = -u - cmd_giro;
-  const float u_dir =  u - cmd_giro;
+  // COMPENSAÇÃO DE ALINHAMENTO/SINCRONISMO ENTRE AS RODAS
+  float erro_sincronismo = pos_esq - pos_dir;
+
+  // APLICAÇÃO DE TENSÃO NOS MOTORES
+  const float u_esq = -u - cmd_giro - (K_DIFF * erro_sincronismo);
+  const float u_dir =  u - cmd_giro + (K_DIFF * erro_sincronismo);
 
   ciclos_sat = (fabsf(u) >= U_LIMIT_V - 0.01f) ? ciclos_sat + 1 : 0;
   ciclos_vel_alta = (fabsf(vel) >= VEL_MAX_MPS - 0.01f) ? ciclos_vel_alta + 1 : 0;
@@ -1112,7 +1122,7 @@ void setup() {
   mqttIniciar();
 
   Serial.println();
-  Serial.printf("=== ROBÔ PÊNDULO ESP32 | LQR <-> PID + MQTT Telemetria ===\n");
+  Serial.printf("=== ROBÔ PÊNDULO ESP32 | LQR <-> PID + Sincronismo + MQTT ===\n");
 
   if (digitalRead(PIN_BOOT) == LOW) {
     Serial.println("[CANCELADO] Botao BOOT pressionado.");
