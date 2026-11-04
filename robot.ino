@@ -13,10 +13,46 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 
-// ============================================================
-// FW2 RESILIENTE - LQR Puro + Movimentação Perfeita Liberada
-// ============================================================
+// BIBLIOTECAS MQTT E FREERTOS
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
 
+// ============================================================
+// CONFIGURAÇÕES MQTT - HIVEMQ CLOUD
+// ============================================================
+const char* WIFI_SSID = "victor";
+const char* WIFI_PASS = "123456789";
+
+const char* MQTT_HOST = "2d7a96c760874f219c47aea346a92a9d.s1.eu.hivemq.cloud";
+const uint16_t MQTT_PORT = 8883;
+const char* MQTT_USER = "hivemq.webclient.1793641933520";
+const char* MQTT_PASS = "3TMIsG%iLcST@$Omww@JfYU8rzfBZ6r1";
+
+const char* TOPICO_TELEMETRIA = "pendulo/telemetria";
+const char* TOPICO_STATUS     = "pendulo/status";
+
+const uint8_t MQTT_DECIMACAO = 5; // 20 Hz de telemetria
+
+struct Telemetria {
+  uint32_t t_ms;
+  float theta_deg;
+  float omega_deg_s;
+  float pos;
+  float vel;
+  float u;
+};
+
+QueueHandle_t filaTelemetria = nullptr;
+WiFiClientSecure netClient;
+PubSubClient mqtt(netClient);
+
+// ============================================================
+// CONFIGURAÇÃO GERAL DO ROBÔ PÊNDULO
+// ============================================================
 #define MOTORS_ENABLED 1
 
 #define SERVICE_UUID           "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -50,6 +86,11 @@ const float K_X = -6.9220f;
 const float K_THETA = -22.0804f;
 const float K_V = -14.3991f;
 const float K_W = -1.8563f;
+
+// CONTROLE: GANHOS PID (Kp = 4.0 SOLICITADO)
+const float KP_PID = 4.0000f;
+const float KI_PID = 0.0000f;
+const float KD_PID = 0.2500f;
 
 // YAW E MOBILIDADE
 const float VEL_RAMPA_MPS = 2.00f;        
@@ -116,12 +157,87 @@ volatile float cmd_giro = 0.0f;
 volatile int modo_movimento = 0; // 0: Parado, 1: Frente, 2: Ré
 volatile uint32_t t_ultimo_pacote_ms = 0;
 
-// CONTROLE DO TESTE DE QUEDA DE 20°
+// CONTROLE DO TESTE DE QUEDA DE 20° E ALTERNÂNCIA DE MODO
 volatile bool aguardando_queda_20deg = false;
 uint32_t t_inicio_teste_ms = 0;
 
+volatile bool modo_pid = false;            // false = LQR | true = PID
+volatile bool btn_triangulo_prev = false;   
+float erro_int = 0.0f;                     
+
 // ============================================================
-// CALLBACKS BLE (GAMEPAD DABBLE - MOVIMENTO PURAMENTE LQR)
+// TASK MQTT (Roda no Core 0)
+// ============================================================
+static void mqttConectaWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) {
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
+static bool mqttConectaBroker() {
+  if (mqtt.connected()) return true;
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  char clientId[32];
+  snprintf(clientId, sizeof(clientId), "esp32-pendulo-%04X", (uint16_t)(ESP.getEfuseMac() >> 32));
+
+  if (mqtt.connect(clientId, MQTT_USER, MQTT_PASS, TOPICO_STATUS, 1, true, "offline")) {
+    mqtt.publish(TOPICO_STATUS, "online", true);
+    return true;
+  }
+  return false;
+}
+
+static void mqttTask(void* param) {
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+
+  netClient.setInsecure();
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setBufferSize(512);
+  mqtt.setKeepAlive(30);
+
+  uint32_t t_ultima_tentativa = 0;
+  Telemetria d;
+  char payload[256];
+
+  for (;;) {
+    mqttConectaWiFi();
+
+    if (!mqtt.connected()) {
+      while (xQueueReceive(filaTelemetria, &d, 0) == pdTRUE) {}
+
+      if (millis() - t_ultima_tentativa > 3000) {
+        t_ultima_tentativa = millis();
+        mqttConectaBroker();
+      }
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+
+    mqtt.loop();
+
+    while (xQueueReceive(filaTelemetria, &d, 0) == pdTRUE) {
+      snprintf(payload, sizeof(payload),
+               "{\"t\":%lu,\"theta\":%.3f,\"omega\":%.3f,\"pos\":%.4f,\"vel\":%.4f,\"u\":%.3f}",
+               (unsigned long)d.t_ms, d.theta_deg, d.omega_deg_s, d.pos, d.vel, d.u);
+      mqtt.publish(TOPICO_TELEMETRIA, payload);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+}
+
+void mqttIniciar() {
+  filaTelemetria = xQueueCreate(64, sizeof(Telemetria));
+  xTaskCreatePinnedToCore(mqttTask, "mqtt_task", 8192, nullptr, 1, nullptr, 0);
+}
+
+// ============================================================
+// CALLBACKS BLE (TRIÂNGULO IDENTIFICADO EM 0x04)
 // ============================================================
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) { deviceConnected = true; };
@@ -145,6 +261,19 @@ class MyCallbacks: public BLECharacteristicCallbacks {
       if (len >= 6 && data[0] == 0xFF) {
         uint8_t btn_forma = data[5];
         uint8_t btn_setas = (len >= 7) ? data[6] : 0;
+
+        // BOTAO TRIÂNGULO (IDENTIFICADO COM MÁSCARA 0x04)
+        bool btn_triangulo_atual = (btn_forma & 0x04);
+        if (btn_triangulo_atual && !btn_triangulo_prev) {
+          modo_pid = !modo_pid;
+          erro_int = 0.0f; // Reseta o integrador do PID ao trocar de malha
+          if (modo_pid) {
+            Serial.println("\n>>> MODO ALTERNADO PARA: PID (Kp = 4.0) <<<");
+          } else {
+            Serial.println("\n>>> MODO ALTERNADO PARA: LQR PURO <<<");
+          }
+        }
+        btn_triangulo_prev = btn_triangulo_atual;
 
         // BOTAO QUADRADO (0x20) -> TESTE DE QUEDA DE 20°
         if (btn_forma & 0x20) {
@@ -171,7 +300,13 @@ class MyCallbacks: public BLECharacteristicCallbacks {
       } 
       else if (len == 1) {
         char c = rxValue[0];
-        if (c == 'S' || c == 'q') { aguardando_queda_20deg = true; }
+        if (c == 't' || c == 'T' || c == 'U' || c == 'u') { 
+          modo_pid = !modo_pid; 
+          erro_int = 0.0f;
+          if (modo_pid) Serial.println("\n>>> MODO ALTERNADO PARA: PID (Kp = 4.0) <<<");
+          else Serial.println("\n>>> MODO ALTERNADO PARA: LQR PURO <<<");
+        }
+        else if (c == 'S' || c == 'q') { aguardando_queda_20deg = true; }
         else if (c == 'F') { modo_movimento = 1; cmd_giro = 0.0f; }
         else if (c == 'B') { modo_movimento = 2; cmd_giro = 0.0f; }
         else if (c == 'L') { modo_movimento = 0; cmd_giro = -PASSO_GIRO; }
@@ -539,6 +674,7 @@ void iniciaControle() {
   ciclos_vel_alta = 0;
 
   primeiro_ciclo = true;
+  erro_int = 0.0f;
 
   t0_us = micros();
 
@@ -560,7 +696,7 @@ void iniciaControle() {
 }
 
 // ============================================================
-// ROTINA DE CONTROLE (100 Hz - PURAMENTE LQR)
+// ROTINA DE CONTROLE (100 Hz - LQR / PID DINÂMICO)
 // ============================================================
 void controle() {
   const uint32_t t_entrada = micros();
@@ -778,12 +914,36 @@ void controle() {
 
   const float erro_pos = pos - x_ref;
 
-  // MALHA LQR PURA
-  float esforco = -(K_X * erro_pos + K_THETA * (theta - theta_bias) + K_V * vel + K_W * omega);
+  // CÁLCULO DE ESFORÇO: ALTERNÂNCIA LQR <-> PID
+  float esforco = 0.0f;
+
+  if (modo_pid) {
+    float erro_theta = (theta - theta_bias);
+    erro_int += erro_theta * TS;
+    erro_int = fmaxf(-2.0f, fminf(2.0f, erro_int));
+    esforco = -(KP_PID * erro_theta + KI_PID * erro_int + KD_PID * omega);
+  } else {
+    esforco = -(K_X * erro_pos + K_THETA * (theta - theta_bias) + K_V * vel + K_W * omega);
+  }
+
   esforco = fmaxf(-12.0f, fminf(12.0f, esforco));
 
   float u = esforco * g_ramp;
   u = fmaxf(-U_LIMIT_V, fminf(U_LIMIT_V, u));
+
+  // ENVIO MQTT (Não-bloqueante no Core 0)
+  static uint8_t cont_mqtt = 0;
+  if (++cont_mqtt >= MQTT_DECIMACAO) {
+    cont_mqtt = 0;
+    Telemetria d;
+    d.t_ms        = millis();
+    d.theta_deg   = theta_deg;
+    d.omega_deg_s = omega_deg_s;
+    d.pos         = pos;
+    d.vel         = vel;
+    d.u           = u;
+    xQueueSend(filaTelemetria, &d, 0);
+  }
 
   // IMPRESSÃO DATALOGGER
   if (t_inicio_teste_ms > 0) {
@@ -949,8 +1109,10 @@ void setup() {
   pService->start();
   pServer->getAdvertising()->start();
 
+  mqttIniciar();
+
   Serial.println();
-  Serial.printf("=== ROBÔ PÊNDULO ESP32 | LQR Puro + Movimentação OK ===\n");
+  Serial.printf("=== ROBÔ PÊNDULO ESP32 | LQR <-> PID + MQTT Telemetria ===\n");
 
   if (digitalRead(PIN_BOOT) == LOW) {
     Serial.println("[CANCELADO] Botao BOOT pressionado.");
