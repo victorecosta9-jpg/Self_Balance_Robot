@@ -29,8 +29,8 @@ const char* WIFI_PASS = "123456789";
 
 const char* MQTT_HOST = "2d7a96c760874f219c47aea346a92a9d.s1.eu.hivemq.cloud";
 const uint16_t MQTT_PORT = 8883;
-const char* MQTT_USER = "hivemq.webclient.1793641933520";
-const char* MQTT_PASS = "3TMIsG%iLcST@$Omww@JfYU8rzfBZ6r1";
+const char* MQTT_USER = "kaique";
+const char* MQTT_PASS = "1234!@#$";
 
 const char* TOPICO_TELEMETRIA = "pendulo/telemetria";
 const char* TOPICO_STATUS     = "pendulo/status";
@@ -88,9 +88,9 @@ const float K_V = -14.3991f;
 const float K_W = -1.8563f;
 
 // CONTROLE: GANHOS PID (SOLICITADO)
-const float KP_PID = 12.0000f;
+const float KP_PID = 60.0000f;
 const float KI_PID = 0.0000f;
-const float KD_PID = 0.8500f;
+const float KD_PID = 10.0000f;
 
 // CONTROLE: COMPENSAÇÃO DE ALINHAMENTO/SINCRONISMO DAS RODAS
 const float K_DIFF = 2.5000f;
